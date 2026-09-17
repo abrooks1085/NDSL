@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import abc
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from types import ModuleType
 from typing import Any, Generic, Self, TypeVar, cast
 
+import copy
+import math
 import numpy as np
 
 import ndsl.constants as constants
@@ -12,7 +14,8 @@ from ndsl.buffer import array_buffer, device_synchronize, recv_buffer, send_buff
 from ndsl.comm.boundary import Boundary
 from ndsl.comm.comm_abc import Comm as CommABC
 from ndsl.comm.comm_abc import ReductionOperator
-from ndsl.comm.partitioner import CubedSpherePartitioner, Partitioner, TilePartitioner
+from ndsl.comm.partitioner import CoarseToFineExchangePlan, CubedSpherePartitioner, NestedPartitioner, Partitioner, TilePartitioner
+from ndsl.halo.exchange_transform import Coarse2FineHaloExchangeTransform, IndexedProlongation
 from ndsl.halo.updater import HaloUpdater, HaloUpdateRequest, VectorInterfaceHaloUpdater
 from ndsl.optional_imports import cupy
 from ndsl.performance.timer import NullTimer, Timer
@@ -859,3 +862,649 @@ class CubedSphereCommunicator(Communicator[CubedSpherePartitioner]):
             allow_mismatch_float_precision=True,
         )
         return recv_quantity
+
+class NestedGridCommunicator(Communicator[NestedPartitioner]):
+    """Communicator for ranks belonging to one nested grid patch."""
+
+    @classmethod
+    def from_layout(
+        cls,
+        comm: CommABC,
+        layout: tuple[int, int],
+        force_cpu: bool = False,
+        timer: Timer | None = None,
+    ) -> NestedGridCommunicator:
+        raise NotImplementedError(
+            "NestedGridCommunicator requires an existing NestedPartitioner"
+        )
+
+    @property
+    def tile(self) -> NestedGridCommunicator:
+        return self
+
+class NestedCommunicator:
+    """Coordinate a parent domain and one nested fine-grid patch.
+
+    World ranks are assigned contiguously, with parent ranks first followed by
+    nested ranks.
+    """
+
+    def __init__(
+        self,
+        comm: CommABC,
+        parent_partitioner: Partitioner,
+        nested_partitioner: NestedPartitioner,
+        force_cpu: bool = False,
+        timer: Timer | None = None,
+        parent_communicator_factory: Callable[..., Communicator] | None = None,
+    ) -> None:
+        if not issubclass(type(comm), CommABC):
+            raise TypeError(
+                "NestedCommunicator requires a CommABC communication "
+                f"subsystem, got {type(comm)}."
+            )
+
+        self.world_comm = comm
+        self.comm = self.world_comm
+
+        self.parent_partitioner = parent_partitioner
+        self.nested_partitioner = nested_partitioner
+
+        self._force_cpu = force_cpu
+        self.timer = timer if timer is not None else NullTimer()
+        self._last_halo_tag = 0
+
+        self.world_rank = comm.Get_rank()
+        self.world_size = comm.Get_size()
+
+        self.parent_size = parent_partitioner.total_ranks
+        self.nested_size = nested_partitioner.total_ranks
+
+        required_size = self.parent_size + self.nested_size
+        if self.world_size != required_size:
+            raise ValueError(
+                f"NestedCommunicator requires exactly {required_size} world ranks: "
+                f"{self.parent_size} parent + {self.nested_size} nested. "
+                f"Got {self.world_size}."
+            )
+
+        self.is_parent_rank = self.world_rank < self.parent_size
+        self.is_nested_rank = not self.is_parent_rank
+
+        raw_role_comm = self.world_comm.Split(
+            color=0 if self.is_parent_rank else 1,
+            key=self.world_rank,
+        )
+
+        role_comm = copy.copy(self.world_comm)
+        role_comm._comm = raw_role_comm
+
+        self.parent_mpi_comm: CommABC | None = None
+        self.nested_mpi_comm: CommABC | None = None
+
+        self.parent_communicator: Communicator | None = None
+        self.nested_communicator: NestedGridCommunicator | None = None
+
+        if self.is_parent_rank:
+            self.parent_mpi_comm = role_comm
+
+            if parent_communicator_factory is None:
+                self.parent_communicator = self._build_default_parent_communicator(
+                    comm=self.parent_mpi_comm,
+                    partitioner=self.parent_partitioner,
+                )
+            else:
+                self.parent_communicator = parent_communicator_factory(
+                    self.parent_mpi_comm,
+                    self.parent_partitioner,
+                    force_cpu,
+                    self.timer,
+                )
+        else:
+            self.nested_mpi_comm = role_comm
+            self.nested_communicator = NestedGridCommunicator(
+                comm=self.nested_mpi_comm,
+                partitioner=self.nested_partitioner,
+                force_cpu=force_cpu,
+                timer=self.timer,
+            )
+
+    def _build_default_parent_communicator(
+        self,
+        comm: CommABC,
+        partitioner: Partitioner,
+    ) -> Communicator:
+        if isinstance(partitioner, CubedSpherePartitioner):
+            return CubedSphereCommunicator(
+                comm=comm,
+                partitioner=partitioner,
+                force_cpu=self._force_cpu,
+                timer=self.timer,
+            )
+
+        if isinstance(partitioner, TilePartitioner):
+            return TileCommunicator(
+                comm=comm,
+                partitioner=partitioner,
+                force_cpu=self._force_cpu,
+                timer=self.timer,
+            )
+
+        raise TypeError(
+            "No default communicator is known for parent partitioner "
+            f"{type(partitioner)}. Supply parent_communicator_factory."
+        )
+
+    def _parent_tile_partitioner(self) -> TilePartitioner:
+        if isinstance(self.parent_partitioner, CubedSpherePartitioner):
+            return self.parent_partitioner.tile
+
+        if isinstance(self.parent_partitioner, TilePartitioner):
+            return self.parent_partitioner
+
+        raise TypeError(
+            "coarse-to-fine communication currently supports "
+            "TilePartitioner or CubedSpherePartitioner parents, "
+            f"got {type(self.parent_partitioner)}"
+        )
+
+    @staticmethod
+    def _horizontal_axes(dims: Sequence[str]) -> tuple[int, int]:
+        i_axes = [
+            index for index, dim in enumerate(dims)
+            if dim in constants.I_DIMS
+        ]
+        j_axes = [
+            index for index, dim in enumerate(dims)
+            if dim in constants.J_DIMS
+        ]
+
+        if len(i_axes) != 1 or len(j_axes) != 1:
+            raise ValueError(
+                "coarse-to-fine exchange requires exactly one I dimension "
+                f"and one J dimension, got {tuple(dims)}"
+            )
+
+        return i_axes[0], j_axes[0]
+
+    @property
+    def parent_rank(self) -> int | None:
+        if self.parent_mpi_comm is None:
+            return None
+        return self.parent_mpi_comm.Get_rank()
+
+    @property
+    def nested_rank(self) -> int | None:
+        if self.nested_mpi_comm is None:
+            return None
+        return self.nested_mpi_comm.Get_rank()
+
+    def update_nested_halo(
+        self,
+        fine_quantity: Quantity | None,
+        n_points: int,
+    ) -> None:
+        """Perform same-resolution fine-to-fine halo communication."""
+        if not self.is_nested_rank:
+            return
+
+        if fine_quantity is None:
+            raise ValueError("fine_quantity is required on nested ranks")
+
+        assert self.nested_communicator is not None
+        self.nested_communicator.halo_update(
+            fine_quantity,
+            n_points=n_points,
+        )
+
+    def _parent_quantity_geometry(
+        self,
+        coarse_quantity: Quantity | None,
+        anchor_parent_rank: int,
+    ) -> tuple[tuple[str, ...], tuple[int, ...]]:
+        parent_info = None
+
+        if self.world_rank == anchor_parent_rank:
+            if coarse_quantity is None:
+                raise ValueError(
+                    "coarse_quantity must be supplied on the "
+                    "NestMapping anchor parent rank"
+                )
+
+            parent_tile = self._parent_tile_partitioner()
+            parent_info = (
+                tuple(coarse_quantity.dims),
+                tuple(parent_tile.global_extent(coarse_quantity.metadata)),
+            )
+
+        parent_info = self.world_comm.bcast(
+            parent_info,
+            root=anchor_parent_rank,
+        )
+
+        if parent_info is None:
+            raise RuntimeError("Failed to broadcast parent quantity geometry")
+
+        dims = tuple(parent_info[0])
+        extent = tuple(int(value) for value in parent_info[1])
+        return dims, extent
+
+    def _nested_quantity_geometry(
+        self,
+        fine_quantity: Quantity | None,
+    ) -> tuple[tuple[str, ...], tuple[int, ...]]:
+        fine_anchor_world_rank = self.parent_size
+        fine_info = None
+
+        if self.world_rank == fine_anchor_world_rank:
+            if fine_quantity is None:
+                raise ValueError(
+                    "fine_quantity must be supplied on nested rank zero"
+                )
+
+            fine_info = (
+                tuple(fine_quantity.dims),
+                tuple(
+                    self.nested_partitioner.global_extent(
+                        fine_quantity.metadata
+                    )
+                ),
+            )
+
+        fine_info = self.world_comm.bcast(
+            fine_info,
+            root=fine_anchor_world_rank,
+        )
+
+        if fine_info is None:
+            raise RuntimeError("Failed to broadcast nested quantity geometry")
+
+        dims = tuple(fine_info[0])
+        extent = tuple(int(value) for value in fine_info[1])
+        return dims, extent
+
+    def _collect_coarse_to_fine_exchanges(
+        self,
+        parent_tile_extent: tuple[int, ...],
+        fine_global_extent: tuple[int, ...],
+        dims: tuple[str, ...],
+        n_points: int,
+    ) -> tuple[
+        list[Boundary],
+        dict[int, list[CoarseToFineExchangePlan]],
+        dict[int, list[Boundary]],
+    ]:
+        boundaries: list[Boundary] = []
+        peer_plans: dict[int, list[CoarseToFineExchangePlan]] = {}
+        peer_boundaries: dict[int, list[Boundary]] = {}
+
+        if self.is_parent_rank:
+            nested_ranks_to_process = range(self.nested_size)
+        else:
+            nested_rank = self.nested_rank
+            assert nested_rank is not None
+            nested_ranks_to_process = (nested_rank,)
+
+        for nested_rank in nested_ranks_to_process:
+            nested_world_rank = self.parent_size + nested_rank
+            external_boundaries = set(
+                self.nested_partitioner.external_boundary_types(nested_rank)
+            )
+
+            for boundary_type in constants.BOUNDARY_TYPES:
+                if boundary_type not in external_boundaries:
+                    continue
+
+                exchanges = self.nested_partitioner.coarse_to_fine_boundaries(
+                    parent_partitioner=self.parent_partitioner,
+                    parent_tile_extent=parent_tile_extent,
+                    fine_global_extent=fine_global_extent,
+                    dims=dims,
+                    boundary_type=boundary_type,
+                    nested_rank=nested_rank,
+                    nested_world_rank=nested_world_rank,
+                    n_points=n_points,
+                )
+
+                for plan, coarse_boundary, fine_boundary in exchanges:
+                    if self.is_parent_rank:
+                        if self.world_rank != plan.parent_rank:
+                            continue
+
+                        peer_rank = nested_world_rank
+                        boundary = coarse_boundary
+                    else:
+                        peer_rank = plan.parent_rank
+                        boundary = fine_boundary
+
+                    boundaries.append(boundary)
+                    peer_plans.setdefault(peer_rank, []).append(plan)
+                    peer_boundaries.setdefault(peer_rank, []).append(boundary)
+
+        return boundaries, peer_plans, peer_boundaries
+
+    @staticmethod
+    def _window_shape(window: tuple[slice, ...]) -> tuple[int, ...]:
+        shape = []
+
+        for entry in window:
+            if entry.start is None or entry.stop is None:
+                raise ValueError(
+                    "coarse-to-fine windows must be bounded"
+                )
+
+            shape.append(entry.stop - entry.start)
+
+        return tuple(shape)
+
+
+    @staticmethod
+    def _ravel_index(
+        indices: Sequence[int],
+        shape: Sequence[int],
+    ) -> int:
+        flat_index = 0
+
+        for index, extent in zip(indices, shape):
+            flat_index = flat_index * extent + index
+
+        return flat_index
+
+
+    def _build_coarse_to_fine_transforms(
+        self,
+        specification: QuantityHaloSpec,
+        peer_plans: dict[int, list[CoarseToFineExchangePlan]],
+        peer_boundaries: dict[int, list[Boundary]],
+    ) -> dict[int, Coarse2FineHaloExchangeTransform]:
+        exchange_transforms: dict[
+            int, Coarse2FineHaloExchangeTransform
+        ] = {}
+
+        i_axis, j_axis = self._horizontal_axes(specification.dims)
+
+        for peer_rank, plans in peer_plans.items():
+            boundaries = peer_boundaries[peer_rank]
+
+            if len(boundaries) != len(plans):
+                raise RuntimeError("peer boundary/plan count mismatch")
+
+            if self.is_parent_rank:
+                windows = tuple(
+                    boundary.send_slice(specification)
+                    for boundary in boundaries
+                )
+
+                aggregated_source_indices: list[int] = []
+                coarse_offset = 0
+
+                for plan, window in zip(plans, windows):
+                    coarse_shape = self._window_shape(window)
+
+                    if (
+                        coarse_shape[i_axis] != plan.coarse_extent[0]
+                        or coarse_shape[j_axis] != plan.coarse_extent[1]
+                    ):
+                        raise RuntimeError(
+                            "planned coarse extent does not match "
+                            "the coarse Quantity window"
+                        )
+
+                    horizontal_fine_size = (
+                        plan.fine_extent[0] * plan.fine_extent[1]
+                    )
+
+                    if len(plan.source_indices) != horizontal_fine_size:
+                        raise RuntimeError(
+                            "coarse-to-fine plan has inconsistent "
+                            "source-index count: "
+                            f"{len(plan.source_indices)} != "
+                            f"{horizontal_fine_size}"
+                        )
+
+                    fine_shape = list(coarse_shape)
+                    fine_shape[i_axis] = plan.fine_extent[0]
+                    fine_shape[j_axis] = plan.fine_extent[1]
+
+                    for fine_indices in np.ndindex(*fine_shape):
+                        fine_i = fine_indices[i_axis]
+                        fine_j = fine_indices[j_axis]
+
+                        horizontal_fine_index = (
+                            fine_i * plan.fine_extent[1] + fine_j
+                        )
+                        horizontal_source_index = (
+                            plan.source_indices[horizontal_fine_index]
+                        )
+
+                        coarse_i = (
+                            horizontal_source_index
+                            // plan.coarse_extent[1]
+                        )
+                        coarse_j = (
+                            horizontal_source_index
+                            % plan.coarse_extent[1]
+                        )
+
+                        coarse_indices = list(fine_indices)
+                        coarse_indices[i_axis] = coarse_i
+                        coarse_indices[j_axis] = coarse_j
+
+                        source_index = self._ravel_index(
+                            coarse_indices,
+                            coarse_shape,
+                        )
+
+                        aggregated_source_indices.append(
+                            coarse_offset + source_index
+                        )
+
+                    coarse_offset += math.prod(coarse_shape)
+
+                transport_size = len(aggregated_source_indices)
+
+                exchange_transforms[peer_rank] = (
+                    Coarse2FineHaloExchangeTransform(
+                        role="coarse",
+                        transport_size=transport_size,
+                        windows=windows,
+                        prolongation=IndexedProlongation(
+                            aggregated_source_indices
+                        ),
+                    )
+                )
+
+            else:
+                windows = tuple(
+                    boundary.recv_slice(specification)
+                    for boundary in boundaries
+                )
+
+                transport_size = 0
+
+                for plan, window in zip(plans, windows):
+                    fine_shape = self._window_shape(window)
+
+                    if (
+                        fine_shape[i_axis] != plan.fine_extent[0]
+                        or fine_shape[j_axis] != plan.fine_extent[1]
+                    ):
+                        raise RuntimeError(
+                            "planned fine extent does not match "
+                            "the fine Quantity window"
+                        )
+
+                    transport_size += math.prod(fine_shape)
+
+                exchange_transforms[peer_rank] = (
+                    Coarse2FineHaloExchangeTransform(
+                        role="fine",
+                        transport_size=transport_size,
+                        windows=windows,
+                    )
+                )
+
+        return exchange_transforms
+
+    def coarse_to_fine(
+        self,
+        coarse_quantity: Quantity | None,
+        fine_quantity: Quantity | None,
+        n_points: int,
+    ) -> None:
+        """Perform transformed parent-to-nested halo exchanges.
+
+        Exchange geometry is derived from Quantity dimensions and parent/nested
+        global extents rather than from a named grid staggering.
+        """
+        if n_points <= 0:
+            raise ValueError("n_points must be positive")
+
+        anchor_parent_rank = self.nested_partitioner.mapping.parent_rank
+        if anchor_parent_rank >= self.parent_size:
+            raise ValueError(
+                f"NestMapping parent_rank={anchor_parent_rank} is outside "
+                f"parent communicator of size {self.parent_size}"
+            )
+
+        parent_dims, parent_tile_extent = self._parent_quantity_geometry(
+            coarse_quantity,
+            anchor_parent_rank,
+        )
+        fine_dims, fine_global_extent = self._nested_quantity_geometry(
+            fine_quantity
+        )
+
+        if parent_dims != fine_dims:
+            raise ValueError(
+                "parent and nested quantities must have matching dimensions: "
+                f"parent={parent_dims}, nested={fine_dims}"
+            )
+
+        dims = parent_dims
+
+        boundaries, peer_plans, peer_boundaries = (
+            self._collect_coarse_to_fine_exchanges(
+                parent_tile_extent=parent_tile_extent,
+                fine_global_extent=fine_global_extent,
+                dims=dims,
+                n_points=n_points,
+            )
+        )
+
+        # Advance the world-communicator tag on every rank, including parent
+        # ranks which do not participate in this particular nested exchange.
+        tag = self._get_halo_tag()
+
+        if not boundaries:
+            return
+
+        if self.is_parent_rank:
+            if coarse_quantity is None:
+                raise ValueError(
+                    "coarse_quantity is required on a parent rank "
+                    "participating in a nested exchange"
+                )
+            quantity = coarse_quantity
+        else:
+            if fine_quantity is None:
+                raise ValueError("fine_quantity is required on nested ranks")
+            quantity = fine_quantity
+
+        if tuple(quantity.dims) != dims:
+            raise ValueError(
+                "local Quantity dimensions do not match the planned exchange: "
+                f"expected {dims}, got {quantity.dims}"
+            )
+
+        specification = self._quantity_halo_spec(
+            quantity,
+            n_points=n_points,
+        )
+
+        exchange_transforms = self._build_coarse_to_fine_transforms(
+            specification=specification,
+            peer_plans=peer_plans,
+            peer_boundaries=peer_boundaries,
+        )
+
+        updater = HaloUpdater.from_scalar_specifications(
+            comm=self,
+            numpy_like_module=self._maybe_force_cpu(quantity.np),
+            specifications=[specification],
+            boundaries=boundaries,
+            tag=tag,
+            optional_timer=self.timer,
+            exchange_transforms=exchange_transforms,
+        )
+
+        updater.force_finalize_on_wait()
+        updater.update([quantity])
+
+    def update_nested_boundaries(
+        self,
+        coarse_quantity: Quantity | None,
+        fine_quantity: Quantity | None,
+        n_points: int,
+    ) -> None:
+        """Update fine-grid internal halos and external coarse boundaries.
+
+        Fine-to-fine halo communication is completed before coarse-to-fine
+        values are written into the external nested-grid halos.
+        """
+        self.update_nested_halo(
+            fine_quantity=fine_quantity,
+            n_points=n_points,
+        )
+
+        self.coarse_to_fine(
+            coarse_quantity=coarse_quantity,
+            fine_quantity=fine_quantity,
+            n_points=n_points,
+        )
+
+    def _get_halo_tag(self) -> int:
+        self._last_halo_tag += 1
+        return self._last_halo_tag
+
+    def __getattr__(self, name: str):
+        """Delegate parent-domain operations on parent ranks."""
+        parent_communicator = object.__getattribute__(
+            self,
+            "parent_communicator",
+        )
+
+        if parent_communicator is None:
+            raise AttributeError(
+                f"Nested world rank {self.world_rank} cannot access "
+                f"parent communicator attribute {name!r}."
+            )
+
+        return getattr(parent_communicator, name)
+
+    def _device_synchronize(self) -> None:
+        Communicator._device_synchronize()
+
+    def _maybe_force_cpu(self, module: ModuleType) -> ModuleType:
+        if self._force_cpu:
+            return np
+        return module
+
+    def _quantity_halo_spec(
+        self,
+        quantity: Quantity,
+        n_points: int,
+    ) -> QuantityHaloSpec:
+        data = quantity[:]
+
+        return QuantityHaloSpec(
+            n_points=n_points,
+            shape=quantity.shape,
+            strides=data.strides,
+            itemsize=data.itemsize,
+            origin=quantity.origin,
+            extent=quantity.extent,
+            dims=quantity.dims,
+            numpy_module=self._maybe_force_cpu(quantity.np),
+            dtype=quantity.metadata.dtype,
+        )

@@ -3,7 +3,9 @@ from __future__ import annotations
 import abc
 import copy
 import functools
+import math
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Self, TypeVar, cast
 
 import f90nml
@@ -11,6 +13,7 @@ import numpy as np
 
 import ndsl.constants as constants
 from ndsl.comm import boundary as bd
+from ndsl.comm._boundary_utils import boundary_at_start_of_dim
 from ndsl.constants import (
     EAST,
     NORTH,
@@ -29,7 +32,14 @@ from ndsl.utils import list_by_dims
 # should not be that many
 DEFAULT_CACHE_SIZE = None
 
-__all__ = ["TilePartitioner", "CubedSpherePartitioner", "get_tile_index"]
+__all__ = [
+        "TilePartitioner", 
+        "CubedSpherePartitioner", 
+        "NestedPartitioner",
+        "NestMapping",
+        "CoarseToFineExchangePlan", 
+        "get_tile_index",
+]
 
 
 def get_tile_index(rank: int, total_ranks: int) -> int:
@@ -41,6 +51,70 @@ def get_tile_index(rank: int, total_ranks: int) -> int:
     ranks_per_tile = total_ranks // 6
     return rank // ranks_per_tile
 
+@dataclass(frozen=True)
+class NestMapping:
+    """Describe the relationship between a nested patch and its parent domain.
+
+    parent_rank
+        Parent-communicator rank containing the nest anchor.
+
+    parent_region
+        Optional identifier for the parent region. For a cubed sphere this can
+        be the parent tile index. NestedPartitioner does not interpret it.
+
+    parent_start
+        (i, j) index of the lower-left coarse cell covered by the nest.
+
+    parent_extent
+        Number of coarse cells covered by the nest in (i, j).
+
+    refinement_ratio
+        Integer fine/coarse refinement ratio.
+    """
+
+    parent_rank: int
+    parent_start: tuple[int, int]
+    parent_extent: tuple[int, int]
+    refinement_ratio: int
+    parent_region: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.parent_rank < 0:
+            raise ValueError("parent_rank must be non-negative")
+        if self.parent_start[0] < 0 or self.parent_start[1] < 0:
+            raise ValueError("parent_start must be non-negative")
+        if self.parent_extent[0] <= 0 or self.parent_extent[1] <= 0:
+            raise ValueError("parent_extent must be positive")
+        if self.refinement_ratio <= 1:
+            raise ValueError("refinement_ratio must be greater than one")
+
+    @property
+    def fine_extent(self) -> tuple[int, int]:
+        """Nested compute-domain size in fine cells."""
+        return (
+            self.parent_extent[0] * self.refinement_ratio,
+            self.parent_extent[1] * self.refinement_ratio,
+        )
+
+
+@dataclass(frozen=True)
+class CoarseToFineExchangePlan:
+    """Describe one parent-rank contribution to a nested boundary."""
+
+    parent_rank: int
+    nested_rank: int
+    boundary_type: int
+
+    # Relative to the parent-rank compute origin.
+    coarse_start: tuple[int, int]
+    coarse_extent: tuple[int, int]
+
+    # Relative to the nested-rank compute origin. May reference halo storage.
+    fine_start: tuple[int, int]
+    fine_extent: tuple[int, int]
+
+    # Nearest-neighbor source indices into the flattened coarse window.
+    source_indices: tuple[int, ...]
 
 class Partitioner(abc.ABC):
     tile: TilePartitioner
@@ -657,6 +731,495 @@ class CubedSpherePartitioner(Partitioner):
             overlap=overlap,
         )
 
+class NestedPartitioner(Partitioner):
+    """Partition a single non-periodic nested grid region.
+
+    Internal boundaries connect nested ranks. Boundaries on the exterior of
+    the nested region return None and are supplied by coarse-to-fine updates.
+    """
+
+    def __init__(
+        self,
+        layout: tuple[int, int],
+        mapping: NestMapping,
+    ) -> None:
+        self.mapping = mapping
+
+        # Reuse TilePartitioner decomposition without its periodic topology.
+        super().__init__(
+            tile=TilePartitioner(layout),
+            layout=layout,
+        )
+
+    @property
+    def total_ranks(self) -> int:
+        return self.layout[0] * self.layout[1]
+
+    @property
+    def fine_extent(self) -> tuple[int, int]:
+        return self.mapping.fine_extent
+
+    def tile_index(self, rank: int) -> int:
+        """Return the logical region index for a nested rank."""
+        if rank < 0 or rank >= self.total_ranks:
+            raise ValueError(
+                f"rank {rank} is outside nested communicator "
+                f"of size {self.total_ranks}"
+            )
+        return 0
+
+    def subtile_index(self, rank: int) -> tuple[int, int]:
+        return self.tile.subtile_index(rank)
+
+    def global_extent(
+        self,
+        rank_metadata: QuantityMetadata,
+    ) -> tuple[int, ...]:
+        return self.tile.global_extent(rank_metadata)
+
+    def subtile_extent(
+        self,
+        metadata: QuantityMetadata,
+        rank: int,
+    ) -> tuple[int, ...]:
+        return self.tile.subtile_extent(metadata, rank)
+
+    def subtile_slice(
+        self,
+        rank: int,
+        global_dims: Sequence[str],
+        global_extent: Sequence[int],
+        overlap: bool = False,
+    ) -> tuple[int | slice, ...]:
+        return self.tile.subtile_slice(
+            rank=rank,
+            global_dims=global_dims,
+            global_extent=global_extent,
+            overlap=overlap,
+        )
+
+    def boundary(
+        self,
+        boundary_type: int,
+        rank: int,
+    ) -> bd.SimpleBoundary | None:
+        """Return a fine-to-fine boundary or None at the nest exterior."""
+        j, i = self.subtile_index(rank)
+        ny, nx = self.layout
+
+        offsets = {
+            WEST: (-1, 0),
+            EAST: (1, 0),
+            SOUTH: (0, -1),
+            NORTH: (0, 1),
+            SOUTHWEST: (-1, -1),
+            SOUTHEAST: (1, -1),
+            NORTHWEST: (-1, 1),
+            NORTHEAST: (1, 1),
+        }
+        di, dj = offsets[boundary_type]
+
+        neighbor_i = i + di
+        neighbor_j = j + dj
+
+        if (
+            neighbor_i < 0
+            or neighbor_i >= nx
+            or neighbor_j < 0
+            or neighbor_j >= ny
+        ):
+            return None
+
+        return bd.SimpleBoundary(
+            boundary_type=boundary_type,
+            from_rank=rank,
+            to_rank=neighbor_j * nx + neighbor_i,
+            n_clockwise_rotations=0,
+        )
+
+    def is_external_boundary(
+        self,
+        boundary_type: int,
+        rank: int,
+    ) -> bool:
+        return self.boundary(boundary_type, rank) is None
+
+    def external_boundary_types(
+        self,
+        rank: int,
+    ) -> tuple[int, ...]:
+        return tuple(
+            boundary_type
+            for boundary_type in constants.BOUNDARY_TYPES
+            if self.is_external_boundary(boundary_type, rank)
+        )
+
+    @staticmethod
+    def _horizontal_axes(
+        dims: Sequence[str],
+    ) -> tuple[int, int]:
+        i_axes = [
+            index
+            for index, dim in enumerate(dims)
+            if dim in constants.I_DIMS
+        ]
+        j_axes = [
+            index
+            for index, dim in enumerate(dims)
+            if dim in constants.J_DIMS
+        ]
+
+        if len(i_axes) != 1 or len(j_axes) != 1:
+            raise ValueError(
+                "coarse-to-fine exchange requires exactly one I dimension "
+                f"and one J dimension, got {tuple(dims)}"
+            )
+
+        return i_axes[0], j_axes[0]
+
+    def coarse_to_fine_exchange_plans(
+        self,
+        parent_partitioner: Partitioner,
+        parent_tile_extent: tuple[int, ...],
+        fine_global_extent: tuple[int, ...],
+        dims: tuple[str, ...],
+        boundary_type: int,
+        rank: int,
+        n_points: int,
+    ) -> tuple[CoarseToFineExchangePlan, ...]:
+        """Describe parent-rank contributions to one external nested boundary.
+
+        Grid staggering is determined from the Quantity dimensions and supplied
+        extents rather than from a named A-, C-, or D-grid type.
+        """
+        if not self.is_external_boundary(boundary_type, rank):
+            raise ValueError(
+                f"boundary type {boundary_type} on nested rank {rank} "
+                "is not external"
+            )
+
+        if n_points <= 0:
+            raise ValueError("n_points must be positive")
+
+        i_axis, j_axis = self._horizontal_axes(dims)
+
+        refinement = self.mapping.refinement_ratio
+        parent_i0, parent_j0 = self.mapping.parent_start
+
+        # overlap=True preserves shared interface points in the actual
+        # fine-grid compute domain.
+        fine_slice = self.subtile_slice(
+            rank=rank,
+            global_dims=dims,
+            global_extent=fine_global_extent,
+            overlap=True,
+        )
+
+        fine_i_slice = fine_slice[i_axis]
+        fine_j_slice = fine_slice[j_axis]
+
+        if not isinstance(fine_i_slice, slice):
+            raise TypeError(
+                f"expected horizontal slice, got {fine_i_slice}"
+            )
+        if not isinstance(fine_j_slice, slice):
+            raise TypeError(
+                f"expected horizontal slice, got {fine_j_slice}"
+            )
+
+        fi0 = fine_i_slice.start
+        fi1 = fine_i_slice.stop
+        fj0 = fine_j_slice.start
+        fj1 = fine_j_slice.stop
+
+        if None in (fi0, fi1, fj0, fj1):
+            raise ValueError(
+                f"bounded fine slices required, got {fine_slice}"
+            )
+
+        assert fi0 is not None
+        assert fi1 is not None
+        assert fj0 is not None
+        assert fj1 is not None
+
+        def target_indices(
+            start: int,
+            stop: int,
+            at_start: bool | None,
+        ) -> list[int]:
+            if at_start is True:
+                return list(range(start - n_points, start))
+            if at_start is False:
+                return list(range(stop, stop + n_points))
+            return list(range(start, stop))
+
+        fine_i = target_indices(
+            fi0,
+            fi1,
+            boundary_at_start_of_dim(
+                boundary_type,
+                dims[i_axis],
+            ),
+        )
+        fine_j = target_indices(
+            fj0,
+            fj1,
+            boundary_at_start_of_dim(
+                boundary_type,
+                dims[j_axis],
+            ),
+        )
+
+        # Map each fine-grid coordinate to its order-zero parent coordinate.
+        def parent_index(
+            fine_index: int,
+            dim: str,
+            parent_start: int,
+        ) -> int:
+            offset = (
+                0.0
+                if dim in constants.INTERFACE_DIMS
+                else 0.5
+            )
+            return parent_start + math.floor(
+                (fine_index + offset) / refinement
+            )
+
+        coarse_i = [
+            parent_index(
+                fine_index=i,
+                dim=dims[i_axis],
+                parent_start=parent_i0,
+            )
+            for i in fine_i
+        ]
+        coarse_j = [
+            parent_index(
+                fine_index=j,
+                dim=dims[j_axis],
+                parent_start=parent_j0,
+            )
+            for j in fine_j
+        ]
+
+        if isinstance(parent_partitioner, CubedSpherePartitioner):
+            parent_tile = parent_partitioner.tile
+            tile_root_rank = parent_partitioner.tile_root_rank(
+                self.mapping.parent_rank
+            )
+        elif isinstance(parent_partitioner, TilePartitioner):
+            parent_tile = parent_partitioner
+            tile_root_rank = 0
+        else:
+            raise TypeError(
+                "coarse-to-fine overlap planning currently supports "
+                "TilePartitioner or CubedSpherePartitioner parents, got "
+                f"{type(parent_partitioner)}"
+            )
+
+        plans: list[CoarseToFineExchangePlan] = []
+        covered_fine_points = 0
+
+        # overlap=False assigns each shared parent interface point to one
+        # communication owner.
+        for parent_tile_rank in range(parent_tile.total_ranks):
+            parent_slice = parent_tile.subtile_slice(
+                rank=parent_tile_rank,
+                global_dims=dims,
+                global_extent=parent_tile_extent,
+                overlap=False,
+            )
+
+            parent_i_slice = parent_slice[i_axis]
+            parent_j_slice = parent_slice[j_axis]
+
+            assert isinstance(parent_i_slice, slice)
+            assert isinstance(parent_j_slice, slice)
+            assert parent_i_slice.start is not None
+            assert parent_i_slice.stop is not None
+            assert parent_j_slice.start is not None
+            assert parent_j_slice.stop is not None
+
+            i_positions = [
+                k
+                for k, coarse_index in enumerate(coarse_i)
+                if parent_i_slice.start
+                <= coarse_index
+                < parent_i_slice.stop
+            ]
+            j_positions = [
+                k
+                for k, coarse_index in enumerate(coarse_j)
+                if parent_j_slice.start
+                <= coarse_index
+                < parent_j_slice.stop
+            ]
+
+            if not i_positions or not j_positions:
+                continue
+
+            expected_i = list(
+                range(i_positions[0], i_positions[-1] + 1)
+            )
+            expected_j = list(
+                range(j_positions[0], j_positions[-1] + 1)
+            )
+
+            if (
+                i_positions != expected_i
+                or j_positions != expected_j
+            ):
+                raise RuntimeError(
+                    "parent overlap is not a contiguous rectangular window"
+                )
+
+            ip0 = i_positions[0]
+            ip1 = i_positions[-1] + 1
+            jp0 = j_positions[0]
+            jp1 = j_positions[-1] + 1
+
+            selected_fine_i = fine_i[ip0:ip1]
+            selected_fine_j = fine_j[jp0:jp1]
+            selected_coarse_i = coarse_i[ip0:ip1]
+            selected_coarse_j = coarse_j[jp0:jp1]
+
+            coarse_global_i0 = min(selected_coarse_i)
+            coarse_global_i1 = max(selected_coarse_i) + 1
+            coarse_global_j0 = min(selected_coarse_j)
+            coarse_global_j1 = max(selected_coarse_j) + 1
+
+            coarse_start = (
+                coarse_global_i0 - parent_i_slice.start,
+                coarse_global_j0 - parent_j_slice.start,
+            )
+            coarse_extent = (
+                coarse_global_i1 - coarse_global_i0,
+                coarse_global_j1 - coarse_global_j0,
+            )
+
+            fine_start = (
+                selected_fine_i[0] - fi0,
+                selected_fine_j[0] - fj0,
+            )
+            fine_extent = (
+                len(selected_fine_i),
+                len(selected_fine_j),
+            )
+
+            coarse_nj = coarse_extent[1]
+            source_indices: list[int] = []
+
+            for coarse_index_i in selected_coarse_i:
+                local_i = coarse_index_i - coarse_global_i0
+
+                for coarse_index_j in selected_coarse_j:
+                    local_j = (
+                        coarse_index_j - coarse_global_j0
+                    )
+                    source_indices.append(
+                        local_i * coarse_nj + local_j
+                    )
+
+            plans.append(
+                CoarseToFineExchangePlan(
+                    parent_rank=(
+                        tile_root_rank + parent_tile_rank
+                    ),
+                    nested_rank=rank,
+                    boundary_type=boundary_type,
+                    coarse_start=coarse_start,
+                    coarse_extent=coarse_extent,
+                    fine_start=fine_start,
+                    fine_extent=fine_extent,
+                    source_indices=tuple(source_indices),
+                )
+            )
+
+            covered_fine_points += (
+                fine_extent[0] * fine_extent[1]
+            )
+
+        expected_fine_points = len(fine_i) * len(fine_j)
+
+        if covered_fine_points != expected_fine_points:
+            raise ValueError(
+                "nested halo is not completely covered by "
+                "the selected parent tile: "
+                f"covered {covered_fine_points} of "
+                f"{expected_fine_points} points"
+            )
+
+        return tuple(plans)
+
+    def coarse_to_fine_boundaries(
+        self,
+        parent_partitioner: Partitioner,
+        parent_tile_extent: tuple[int, ...],
+        fine_global_extent: tuple[int, ...],
+        dims: tuple[str, ...],
+        boundary_type: int,
+        nested_rank: int,
+        nested_world_rank: int,
+        n_points: int,
+    ) -> tuple[
+        tuple[
+            CoarseToFineExchangePlan,
+            bd.NestedBoundary,
+            bd.NestedBoundary,
+        ],
+        ...,
+    ]:
+        plans = self.coarse_to_fine_exchange_plans(
+            parent_partitioner=parent_partitioner,
+            parent_tile_extent=parent_tile_extent,
+            fine_global_extent=fine_global_extent,
+            dims=dims,
+            boundary_type=boundary_type,
+            rank=nested_rank,
+            n_points=n_points,
+        )
+
+        result: list[
+            tuple[
+                CoarseToFineExchangePlan,
+                bd.NestedBoundary,
+                bd.NestedBoundary,
+            ]
+        ] = []
+
+        for plan in plans:
+            coarse_boundary = bd.NestedBoundary(
+                from_rank=plan.parent_rank,
+                to_rank=nested_world_rank,
+                n_clockwise_rotations=0,
+                window_start=plan.coarse_start,
+                window_extent=plan.coarse_extent,
+                comm_type=bd.CommType.SEND_ONLY,
+            )
+            fine_boundary = bd.NestedBoundary(
+                from_rank=nested_world_rank,
+                to_rank=plan.parent_rank,
+                n_clockwise_rotations=0,
+                window_start=plan.fine_start,
+                window_extent=plan.fine_extent,
+                comm_type=bd.CommType.RECV_ONLY,
+            )
+
+            result.append((plan, coarse_boundary, fine_boundary))
+
+        return tuple(result)
+
+    def on_tile_bottom(self, rank: int) -> bool:
+        return self.tile.on_tile_bottom(rank)
+
+    def on_tile_top(self, rank: int) -> bool:
+        return self.tile.on_tile_top(rank)
+
+    def on_tile_left(self, rank: int) -> bool:
+        return self.tile.on_tile_left(rank)
+
+    def on_tile_right(self, rank: int) -> bool:
+        return self.tile.on_tile_right(rank)
 
 def on_tile_left(subtile_index: tuple[int, int]) -> bool:
     return subtile_index[1] == 0
