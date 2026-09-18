@@ -56,6 +56,29 @@ def to_numpy(array, dtype=None) -> np.ndarray:  # type: ignore[no-untyped-def]
 
 P = TypeVar("P", bound=Partitioner)
 
+class GridHierarchyCommunicator:
+    def __init__(
+        self,
+        world_comm: CommABC,
+        parent_comm: Communicator | None = None,
+        nested_comms: Mapping[int, Communicator] | None = None,
+    ) -> None:
+        self.world_comm = world_comm
+        self.parent_comm = parent_comm
+        self.nested_comms = (
+                dict(nested_comms)
+                if nested_comms is not None
+                else {}
+        )
+
+    @property
+    def rank(self) -> int:
+        return self.world_comm.Get_rank()
+
+    @property
+    def size(self) -> int:
+        return self.world_comm.Get_size()
+
 
 class Communicator(abc.ABC, Generic[P]):
     def __init__(
