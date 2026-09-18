@@ -916,7 +916,7 @@ class NestedGridCommunicator(Communicator[NestedPartitioner]):
         return self
 
 
-class NestedCommunicator:
+class NestedCommunicator(GridHierarchyCommunicator):
     """Coordinate a parent domain and one nested fine-grid patch.
 
     World ranks are assigned contiguously, with parent ranks first followed by
@@ -1002,6 +1002,17 @@ class NestedCommunicator:
                 force_cpu=force_cpu,
                 timer=self.timer,
             )
+
+        super().__init__(
+            world_comm=self.world_comm,
+            parent_comm=self.parent_communicator,
+            nested_comms=(
+                {0: self.nested_communicator}
+                if self.nested_communicator is not None
+                else None
+            ),
+        )
+
 
     def _build_default_parent_communicator(
         self,
