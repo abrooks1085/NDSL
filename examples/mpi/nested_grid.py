@@ -32,7 +32,7 @@ from ndsl import (
 )
 from ndsl.comm.communicator import NestedCommunicator
 from ndsl.comm.mpi import MPIComm
-from ndsl.comm.partitioner import NestMapping, NestedPartitioner
+from ndsl.comm.partitioner import NestedPartitioner, NestMapping
 from ndsl.constants import (
     I_DIM,
     I_INTERFACE_DIM,
@@ -42,7 +42,6 @@ from ndsl.constants import (
 )
 from ndsl.grid import MetricTerms
 from ndsl.quantity import Quantity
-
 
 # Parent cubed-sphere configuration.
 PARENT_NX = 12
@@ -1090,4 +1089,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

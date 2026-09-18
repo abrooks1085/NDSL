@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import abc
+import copy
+import math
 from collections.abc import Callable, Mapping, Sequence
 from types import ModuleType
 from typing import Any, Generic, Self, TypeVar, cast
 
-import copy
-import math
 import numpy as np
 
 import ndsl.constants as constants
@@ -14,8 +14,17 @@ from ndsl.buffer import array_buffer, device_synchronize, recv_buffer, send_buff
 from ndsl.comm.boundary import Boundary
 from ndsl.comm.comm_abc import Comm as CommABC
 from ndsl.comm.comm_abc import ReductionOperator
-from ndsl.comm.partitioner import CoarseToFineExchangePlan, CubedSpherePartitioner, NestedPartitioner, Partitioner, TilePartitioner
-from ndsl.halo.exchange_transform import Coarse2FineHaloExchangeTransform, IndexedProlongation
+from ndsl.comm.partitioner import (
+    CoarseToFineExchangePlan,
+    CubedSpherePartitioner,
+    NestedPartitioner,
+    Partitioner,
+    TilePartitioner,
+)
+from ndsl.halo.exchange_transform import (
+    Coarse2FineHaloExchangeTransform,
+    IndexedProlongation,
+)
 from ndsl.halo.updater import HaloUpdater, HaloUpdateRequest, VectorInterfaceHaloUpdater
 from ndsl.optional_imports import cupy
 from ndsl.performance.timer import NullTimer, Timer
@@ -863,6 +872,7 @@ class CubedSphereCommunicator(Communicator[CubedSpherePartitioner]):
         )
         return recv_quantity
 
+
 class NestedGridCommunicator(Communicator[NestedPartitioner]):
     """Communicator for ranks belonging to one nested grid patch."""
 
@@ -881,6 +891,7 @@ class NestedGridCommunicator(Communicator[NestedPartitioner]):
     @property
     def tile(self) -> NestedGridCommunicator:
         return self
+
 
 class NestedCommunicator:
     """Coordinate a parent domain and one nested fine-grid patch.
@@ -1010,14 +1021,8 @@ class NestedCommunicator:
 
     @staticmethod
     def _horizontal_axes(dims: Sequence[str]) -> tuple[int, int]:
-        i_axes = [
-            index for index, dim in enumerate(dims)
-            if dim in constants.I_DIMS
-        ]
-        j_axes = [
-            index for index, dim in enumerate(dims)
-            if dim in constants.J_DIMS
-        ]
+        i_axes = [index for index, dim in enumerate(dims) if dim in constants.I_DIMS]
+        j_axes = [index for index, dim in enumerate(dims) if dim in constants.J_DIMS]
 
         if len(i_axes) != 1 or len(j_axes) != 1:
             raise ValueError(
@@ -1098,17 +1103,11 @@ class NestedCommunicator:
 
         if self.world_rank == fine_anchor_world_rank:
             if fine_quantity is None:
-                raise ValueError(
-                    "fine_quantity must be supplied on nested rank zero"
-                )
+                raise ValueError("fine_quantity must be supplied on nested rank zero")
 
             fine_info = (
                 tuple(fine_quantity.dims),
-                tuple(
-                    self.nested_partitioner.global_extent(
-                        fine_quantity.metadata
-                    )
-                ),
+                tuple(self.nested_partitioner.global_extent(fine_quantity.metadata)),
             )
 
         fine_info = self.world_comm.bcast(
@@ -1189,14 +1188,11 @@ class NestedCommunicator:
 
         for entry in window:
             if entry.start is None or entry.stop is None:
-                raise ValueError(
-                    "coarse-to-fine windows must be bounded"
-                )
+                raise ValueError("coarse-to-fine windows must be bounded")
 
             shape.append(entry.stop - entry.start)
 
         return tuple(shape)
-
 
     @staticmethod
     def _ravel_index(
@@ -1210,16 +1206,13 @@ class NestedCommunicator:
 
         return flat_index
 
-
     def _build_coarse_to_fine_transforms(
         self,
         specification: QuantityHaloSpec,
         peer_plans: dict[int, list[CoarseToFineExchangePlan]],
         peer_boundaries: dict[int, list[Boundary]],
     ) -> dict[int, Coarse2FineHaloExchangeTransform]:
-        exchange_transforms: dict[
-            int, Coarse2FineHaloExchangeTransform
-        ] = {}
+        exchange_transforms: dict[int, Coarse2FineHaloExchangeTransform] = {}
 
         i_axis, j_axis = self._horizontal_axes(specification.dims)
 
@@ -1231,8 +1224,7 @@ class NestedCommunicator:
 
             if self.is_parent_rank:
                 windows = tuple(
-                    boundary.send_slice(specification)
-                    for boundary in boundaries
+                    boundary.send_slice(specification) for boundary in boundaries
                 )
 
                 aggregated_source_indices: list[int] = []
@@ -1250,9 +1242,7 @@ class NestedCommunicator:
                             "the coarse Quantity window"
                         )
 
-                    horizontal_fine_size = (
-                        plan.fine_extent[0] * plan.fine_extent[1]
-                    )
+                    horizontal_fine_size = plan.fine_extent[0] * plan.fine_extent[1]
 
                     if len(plan.source_indices) != horizontal_fine_size:
                         raise RuntimeError(
@@ -1270,21 +1260,13 @@ class NestedCommunicator:
                         fine_i = fine_indices[i_axis]
                         fine_j = fine_indices[j_axis]
 
-                        horizontal_fine_index = (
-                            fine_i * plan.fine_extent[1] + fine_j
-                        )
-                        horizontal_source_index = (
-                            plan.source_indices[horizontal_fine_index]
-                        )
+                        horizontal_fine_index = fine_i * plan.fine_extent[1] + fine_j
+                        horizontal_source_index = plan.source_indices[
+                            horizontal_fine_index
+                        ]
 
-                        coarse_i = (
-                            horizontal_source_index
-                            // plan.coarse_extent[1]
-                        )
-                        coarse_j = (
-                            horizontal_source_index
-                            % plan.coarse_extent[1]
-                        )
+                        coarse_i = horizontal_source_index // plan.coarse_extent[1]
+                        coarse_j = horizontal_source_index % plan.coarse_extent[1]
 
                         coarse_indices = list(fine_indices)
                         coarse_indices[i_axis] = coarse_i
@@ -1295,29 +1277,22 @@ class NestedCommunicator:
                             coarse_shape,
                         )
 
-                        aggregated_source_indices.append(
-                            coarse_offset + source_index
-                        )
+                        aggregated_source_indices.append(coarse_offset + source_index)
 
                     coarse_offset += math.prod(coarse_shape)
 
                 transport_size = len(aggregated_source_indices)
 
-                exchange_transforms[peer_rank] = (
-                    Coarse2FineHaloExchangeTransform(
-                        role="coarse",
-                        transport_size=transport_size,
-                        windows=windows,
-                        prolongation=IndexedProlongation(
-                            aggregated_source_indices
-                        ),
-                    )
+                exchange_transforms[peer_rank] = Coarse2FineHaloExchangeTransform(
+                    role="coarse",
+                    transport_size=transport_size,
+                    windows=windows,
+                    prolongation=IndexedProlongation(aggregated_source_indices),
                 )
 
             else:
                 windows = tuple(
-                    boundary.recv_slice(specification)
-                    for boundary in boundaries
+                    boundary.recv_slice(specification) for boundary in boundaries
                 )
 
                 transport_size = 0
@@ -1336,12 +1311,10 @@ class NestedCommunicator:
 
                     transport_size += math.prod(fine_shape)
 
-                exchange_transforms[peer_rank] = (
-                    Coarse2FineHaloExchangeTransform(
-                        role="fine",
-                        transport_size=transport_size,
-                        windows=windows,
-                    )
+                exchange_transforms[peer_rank] = Coarse2FineHaloExchangeTransform(
+                    role="fine",
+                    transport_size=transport_size,
+                    windows=windows,
                 )
 
         return exchange_transforms
@@ -1371,9 +1344,7 @@ class NestedCommunicator:
             coarse_quantity,
             anchor_parent_rank,
         )
-        fine_dims, fine_global_extent = self._nested_quantity_geometry(
-            fine_quantity
-        )
+        fine_dims, fine_global_extent = self._nested_quantity_geometry(fine_quantity)
 
         if parent_dims != fine_dims:
             raise ValueError(

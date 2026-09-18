@@ -73,9 +73,11 @@ class HaloExchangeTransform(abc.ABC):
 
     def synchronize(self) -> None:
         """Synchronize transform-specific work."""
+        return None
 
     def finalize(self) -> None:
         """Release transform-owned resources."""
+        return None
 
 
 class IdentityHaloExchangeTransform(HaloExchangeTransform):
@@ -258,9 +260,7 @@ class Coarse2FineHaloExchangeTransform(HaloExchangeTransform):
         quantity = self._get_scalar_quantity(quantities_x, quantities_y)
 
         if self._recv_buffer is None:
-            raise RuntimeError(
-                "coarse-to-fine receive buffer has not been allocated"
-            )
+            raise RuntimeError("coarse-to-fine receive buffer has not been allocated")
 
         offset = 0
         for window in self._windows:

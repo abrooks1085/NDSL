@@ -33,12 +33,12 @@ from ndsl.utils import list_by_dims
 DEFAULT_CACHE_SIZE = None
 
 __all__ = [
-        "TilePartitioner", 
-        "CubedSpherePartitioner", 
-        "NestedPartitioner",
-        "NestMapping",
-        "CoarseToFineExchangePlan", 
-        "get_tile_index",
+    "TilePartitioner",
+    "CubedSpherePartitioner",
+    "NestedPartitioner",
+    "NestMapping",
+    "CoarseToFineExchangePlan",
+    "get_tile_index",
 ]
 
 
@@ -50,6 +50,7 @@ def get_tile_index(rank: int, total_ranks: int) -> int:
         raise ValueError(f"total_ranks {total_ranks} is not evenly divisible by 6")
     ranks_per_tile = total_ranks // 6
     return rank // ranks_per_tile
+
 
 @dataclass(frozen=True)
 class NestMapping:
@@ -115,6 +116,7 @@ class CoarseToFineExchangePlan:
 
     # Nearest-neighbor source indices into the flattened coarse window.
     source_indices: tuple[int, ...]
+
 
 class Partitioner(abc.ABC):
     tile: TilePartitioner
@@ -731,6 +733,7 @@ class CubedSpherePartitioner(Partitioner):
             overlap=overlap,
         )
 
+
 class NestedPartitioner(Partitioner):
     """Partition a single non-periodic nested grid region.
 
@@ -822,12 +825,7 @@ class NestedPartitioner(Partitioner):
         neighbor_i = i + di
         neighbor_j = j + dj
 
-        if (
-            neighbor_i < 0
-            or neighbor_i >= nx
-            or neighbor_j < 0
-            or neighbor_j >= ny
-        ):
+        if neighbor_i < 0 or neighbor_i >= nx or neighbor_j < 0 or neighbor_j >= ny:
             return None
 
         return bd.SimpleBoundary(
@@ -858,16 +856,8 @@ class NestedPartitioner(Partitioner):
     def _horizontal_axes(
         dims: Sequence[str],
     ) -> tuple[int, int]:
-        i_axes = [
-            index
-            for index, dim in enumerate(dims)
-            if dim in constants.I_DIMS
-        ]
-        j_axes = [
-            index
-            for index, dim in enumerate(dims)
-            if dim in constants.J_DIMS
-        ]
+        i_axes = [index for index, dim in enumerate(dims) if dim in constants.I_DIMS]
+        j_axes = [index for index, dim in enumerate(dims) if dim in constants.J_DIMS]
 
         if len(i_axes) != 1 or len(j_axes) != 1:
             raise ValueError(
@@ -919,13 +909,9 @@ class NestedPartitioner(Partitioner):
         fine_j_slice = fine_slice[j_axis]
 
         if not isinstance(fine_i_slice, slice):
-            raise TypeError(
-                f"expected horizontal slice, got {fine_i_slice}"
-            )
+            raise TypeError(f"expected horizontal slice, got {fine_i_slice}")
         if not isinstance(fine_j_slice, slice):
-            raise TypeError(
-                f"expected horizontal slice, got {fine_j_slice}"
-            )
+            raise TypeError(f"expected horizontal slice, got {fine_j_slice}")
 
         fi0 = fine_i_slice.start
         fi1 = fine_i_slice.stop
@@ -933,9 +919,7 @@ class NestedPartitioner(Partitioner):
         fj1 = fine_j_slice.stop
 
         if None in (fi0, fi1, fj0, fj1):
-            raise ValueError(
-                f"bounded fine slices required, got {fine_slice}"
-            )
+            raise ValueError(f"bounded fine slices required, got {fine_slice}")
 
         assert fi0 is not None
         assert fi1 is not None
@@ -976,14 +960,8 @@ class NestedPartitioner(Partitioner):
             dim: str,
             parent_start: int,
         ) -> int:
-            offset = (
-                0.0
-                if dim in constants.INTERFACE_DIMS
-                else 0.5
-            )
-            return parent_start + math.floor(
-                (fine_index + offset) / refinement
-            )
+            offset = 0.0 if dim in constants.INTERFACE_DIMS else 0.5
+            return parent_start + math.floor((fine_index + offset) / refinement)
 
         coarse_i = [
             parent_index(
@@ -1004,9 +982,7 @@ class NestedPartitioner(Partitioner):
 
         if isinstance(parent_partitioner, CubedSpherePartitioner):
             parent_tile = parent_partitioner.tile
-            tile_root_rank = parent_partitioner.tile_root_rank(
-                self.mapping.parent_rank
-            )
+            tile_root_rank = parent_partitioner.tile_root_rank(self.mapping.parent_rank)
         elif isinstance(parent_partitioner, TilePartitioner):
             parent_tile = parent_partitioner
             tile_root_rank = 0
@@ -1043,32 +1019,21 @@ class NestedPartitioner(Partitioner):
             i_positions = [
                 k
                 for k, coarse_index in enumerate(coarse_i)
-                if parent_i_slice.start
-                <= coarse_index
-                < parent_i_slice.stop
+                if parent_i_slice.start <= coarse_index < parent_i_slice.stop
             ]
             j_positions = [
                 k
                 for k, coarse_index in enumerate(coarse_j)
-                if parent_j_slice.start
-                <= coarse_index
-                < parent_j_slice.stop
+                if parent_j_slice.start <= coarse_index < parent_j_slice.stop
             ]
 
             if not i_positions or not j_positions:
                 continue
 
-            expected_i = list(
-                range(i_positions[0], i_positions[-1] + 1)
-            )
-            expected_j = list(
-                range(j_positions[0], j_positions[-1] + 1)
-            )
+            expected_i = list(range(i_positions[0], i_positions[-1] + 1))
+            expected_j = list(range(j_positions[0], j_positions[-1] + 1))
 
-            if (
-                i_positions != expected_i
-                or j_positions != expected_j
-            ):
+            if i_positions != expected_i or j_positions != expected_j:
                 raise RuntimeError(
                     "parent overlap is not a contiguous rectangular window"
                 )
@@ -1113,18 +1078,12 @@ class NestedPartitioner(Partitioner):
                 local_i = coarse_index_i - coarse_global_i0
 
                 for coarse_index_j in selected_coarse_j:
-                    local_j = (
-                        coarse_index_j - coarse_global_j0
-                    )
-                    source_indices.append(
-                        local_i * coarse_nj + local_j
-                    )
+                    local_j = coarse_index_j - coarse_global_j0
+                    source_indices.append(local_i * coarse_nj + local_j)
 
             plans.append(
                 CoarseToFineExchangePlan(
-                    parent_rank=(
-                        tile_root_rank + parent_tile_rank
-                    ),
+                    parent_rank=(tile_root_rank + parent_tile_rank),
                     nested_rank=rank,
                     boundary_type=boundary_type,
                     coarse_start=coarse_start,
@@ -1135,9 +1094,7 @@ class NestedPartitioner(Partitioner):
                 )
             )
 
-            covered_fine_points += (
-                fine_extent[0] * fine_extent[1]
-            )
+            covered_fine_points += fine_extent[0] * fine_extent[1]
 
         expected_fine_points = len(fine_i) * len(fine_j)
 
@@ -1220,6 +1177,7 @@ class NestedPartitioner(Partitioner):
 
     def on_tile_right(self, rank: int) -> bool:
         return self.tile.on_tile_right(rank)
+
 
 def on_tile_left(subtile_index: tuple[int, int]) -> bool:
     return subtile_index[1] == 0

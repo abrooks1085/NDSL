@@ -94,10 +94,7 @@ class HaloUpdater:
         }
 
         if peer_directions is None:
-            peer_directions = {
-                rank: (True, True)
-                for rank in transformers
-            }
+            peer_directions = {rank: (True, True) for rank in transformers}
 
         unknown_direction_ranks = set(peer_directions) - set(transformers)
 
@@ -121,9 +118,7 @@ class HaloUpdater:
             does_send, does_recv = peer_directions[rank]
 
             if not (does_send or does_recv):
-                raise ValueError(
-                    f"Halo peer {rank} neither sends nor receives"
-                )
+                raise ValueError(f"Halo peer {rank} neither sends nor receives")
 
             self._peer_directions[rank] = (does_send, does_recv)
 
@@ -215,12 +210,12 @@ class HaloUpdater:
             )
 
         return cls(
-                comm,
-                tag,
-                transformers,
-                timer,
-                exchange_transforms=exchange_transforms,
-                peer_directions=peer_directions,
+            comm,
+            tag,
+            transformers,
+            timer,
+            exchange_transforms=exchange_transforms,
+            peer_directions=peer_directions,
         )
 
     @classmethod
@@ -295,12 +290,12 @@ class HaloUpdater:
             )
 
         return cls(
-                comm,
-                tag,
-                transformers,
-                timer,
-                exchange_transforms=exchange_transforms,
-                peer_directions=peer_directions,
+            comm,
+            tag,
+            transformers,
+            timer,
+            exchange_transforms=exchange_transforms,
+            peer_directions=peer_directions,
         )
 
     def update(

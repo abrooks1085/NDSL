@@ -142,6 +142,7 @@ class SimpleBoundary(Boundary):
             interior,
         )
 
+
 @dataclasses.dataclass
 class NestedBoundary(Boundary):
     """An explicit horizontal window relative to the compute-domain origin.
@@ -184,12 +185,8 @@ class NestedBoundary(Boundary):
     def _horizontal_dimension_indices(
         dims: tuple[str, ...],
     ) -> tuple[int, int]:
-        i_indices = [
-            index for index, dim in enumerate(dims) if dim in constants.I_DIMS
-        ]
-        j_indices = [
-            index for index, dim in enumerate(dims) if dim in constants.J_DIMS
-        ]
+        i_indices = [index for index, dim in enumerate(dims) if dim in constants.I_DIMS]
+        j_indices = [index for index, dim in enumerate(dims) if dim in constants.J_DIMS]
 
         if len(i_indices) != 1 or len(j_indices) != 1:
             raise ValueError(
@@ -208,22 +205,14 @@ class NestedBoundary(Boundary):
     ) -> tuple[slice, ...]:
         i_dim, j_dim = self._horizontal_dimension_indices(dims)
 
-        result = [
-            slice(start, start + size)
-            for start, size in zip(origin, extent)
-        ]
+        result = [slice(start, start + size) for start, size in zip(origin, extent)]
 
         i_start = origin[i_dim] + self.window_start[0]
         j_start = origin[j_dim] + self.window_start[1]
         i_stop = i_start + self.window_extent[0]
         j_stop = j_start + self.window_extent[1]
 
-        if (
-            i_start < 0
-            or j_start < 0
-            or i_stop > shape[i_dim]
-            or j_stop > shape[j_dim]
-        ):
+        if i_start < 0 or j_start < 0 or i_stop > shape[i_dim] or j_stop > shape[j_dim]:
             raise ValueError(
                 "NestedBoundary window lies outside allocated data: "
                 f"dims={dims}, start={self.window_start}, "
