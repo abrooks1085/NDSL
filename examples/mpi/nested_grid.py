@@ -17,6 +17,7 @@ Run it with ``mpirun -np 28 python test_nested_grid.py``.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,7 +31,11 @@ from ndsl import (
     SubtileGridSizer,
     TilePartitioner,
 )
-from ndsl.comm.communicator import NestedCommunicator
+from ndsl.comm.communicator import (
+    CubedSphereCommunicator,
+    NestedCommunicator,
+    NestTileCommunicator,
+)
 from ndsl.comm.mpi import MPIComm
 from ndsl.comm.partitioner import NestedPartitioner, NestMapping
 from ndsl.constants import (
@@ -47,14 +52,28 @@ from ndsl.quantity import Quantity
 PARENT_NX = 12
 PARENT_NY = 12
 PARENT_LAYOUT = (2, 2)
-PARENT_TILE = 0
-PARENT_RANK = 0
 
 # Nested patch geometry, expressed in parent-grid cells.
-NEST_PARENT_START = (3, 3)
-NEST_PARENT_EXTENT = (4, 4)
+NEST_PARENT_REGIONS = {
+    0: 0,
+    1: 1,
+}
+NEST_PARENT_RANKS = {
+    0: 0,
+    1: 4,
+}
+NEST_PARENT_STARTS = {
+    0: (3, 3),
+    1: (3, 3),
+}
+NEST_PARENT_EXTENTS = {
+    0: (4, 4),
+    1: (4, 4),
+}
 REFINEMENT_RATIO = 2
 NESTED_LAYOUT = (2, 2)
+
+NEST_IDS = (0, 1)
 
 # Use the normal NDSL metric halo width so the example exercises a realistic
 # multi-point halo rather than a one-point special case.
@@ -107,7 +126,7 @@ def make_parent_metric_terms(
     """
 
     assert communicator.is_parent_rank
-    assert communicator.parent_communicator is not None
+    assert communicator.parent_comm is not None
 
     sizer = SubtileGridSizer.from_tile_params(
         nx_tile=nx_tile,
@@ -116,14 +135,14 @@ def make_parent_metric_terms(
         n_halo=N_HALO,
         layout=PARENT_LAYOUT,
         tile_partitioner=communicator.parent_partitioner.tile,
-        tile_rank=communicator.parent_communicator.tile.rank,
+        tile_rank=communicator.parent_comm.tile.rank,
         backend=backend,
     )
     quantity_factory = QuantityFactory(sizer=sizer, backend=backend)
 
     return MetricTerms(
         quantity_factory=quantity_factory,
-        communicator=communicator.parent_communicator,
+        communicator=communicator.parent_comm,
         grid_type=0,
     )
 
@@ -139,17 +158,21 @@ def check_physical_refinement(
     communicator: NestedCommunicator,
     coarse_metrics: MetricTerms | None,
     fine_metrics: MetricTerms | None,
+    nest_id: int,
 ) -> None:
     """Verify that the reference fine grid refines the selected parent region."""
 
     if not communicator.is_parent_rank:
         return
 
-    assert communicator.parent_communicator is not None
+    assert communicator.parent_comm is not None
     assert coarse_metrics is not None
     assert fine_metrics is not None
 
-    tile_comm = communicator.parent_communicator.tile
+    partitioner = communicator.nested_partitioners[nest_id]
+    mapping = partitioner.mapping
+
+    tile_comm = communicator.parent_comm.tile
 
     # Reconstruct complete coarse and fine-reference tiles on each tile root.
     # Only parent rank zero (the root of the selected tile) uses the gathered
@@ -163,7 +186,14 @@ def check_physical_refinement(
     fine_dx_quantity = tile_comm.gather(fine_metrics.dx)
     fine_dy_quantity = tile_comm.gather(fine_metrics.dy)
 
-    if communicator.world_rank != PARENT_RANK:
+    parent_partitioner = communicator.parent_partitioner
+
+    if not isinstance(parent_partitioner, CubedSpherePartitioner):
+        raise TypeError("nested-grid example requires a CubedSpherePartitioner parent")
+
+    parent_root_rank = parent_partitioner.tile_root_rank(mapping.parent_rank)
+
+    if communicator.world_rank != parent_root_rank:
         return
 
     assert coarse_dgrid_quantity is not None
@@ -184,14 +214,16 @@ def check_physical_refinement(
     fine_dx = np.asarray(fine_dx_quantity.view[:])
     fine_dy = np.asarray(fine_dy_quantity.view[:])
 
-    ci0, cj0 = NEST_PARENT_START
-    ci1 = ci0 + NEST_PARENT_EXTENT[0]
-    cj1 = cj0 + NEST_PARENT_EXTENT[1]
+    ci0, cj0 = mapping.parent_start
+    ci1 = ci0 + mapping.parent_extent[0]
+    cj1 = cj0 + mapping.parent_extent[1]
 
-    fi0 = ci0 * REFINEMENT_RATIO
-    fj0 = cj0 * REFINEMENT_RATIO
-    fi1 = ci1 * REFINEMENT_RATIO
-    fj1 = cj1 * REFINEMENT_RATIO
+    refinement = mapping.refinement_ratio
+
+    fi0 = ci0 * refinement
+    fj0 = cj0 * refinement
+    fi1 = ci1 * refinement
+    fj1 = cj1 * refinement
 
     # The corners of the selected coarse region must coincide with the
     # corresponding points on the higher-resolution reference grid.
@@ -281,16 +313,20 @@ def reference_quantity_payload(quantity: Quantity) -> MetricPayload:
 def get_reference_metric_data(
     communicator: NestedCommunicator,
     fine_metrics: MetricTerms | None,
+    nest_id: int,
 ) -> ReferenceMetricData | None:
     """Gather the fine-reference tile used to construct nested grid metrics."""
 
     if not communicator.is_parent_rank:
         return None
 
-    assert communicator.parent_communicator is not None
+    assert communicator.parent_comm is not None
     assert fine_metrics is not None
 
-    tile_comm = communicator.parent_communicator.tile
+    partitioner = communicator.nested_partitioners[nest_id]
+    mapping = partitioner.mapping
+
+    tile_comm = communicator.parent_comm.tile
     names = (
         "agrid_lon_lat",
         "dgrid_lon_lat",
@@ -303,14 +339,21 @@ def get_reference_metric_data(
         "dyc",
     )
 
+    parent_partitioner = communicator.parent_partitioner
+
+    if not isinstance(parent_partitioner, CubedSpherePartitioner):
+        raise TypeError("nested-grid example requires a CubedSpherePartitioner parent")
+
+    parent_root_rank = parent_partitioner.tile_root_rank(mapping.parent_rank)
+
     reference: ReferenceMetricData = {}
     for name in names:
         tile_quantity = tile_comm.gather(getattr(fine_metrics, name))
-        if communicator.world_rank == PARENT_RANK:
+        if communicator.world_rank == parent_root_rank:
             assert tile_quantity is not None
             reference[name] = reference_quantity_payload(tile_quantity)
 
-    return reference if communicator.world_rank == PARENT_RANK else None
+    return reference if communicator.world_rank == parent_root_rank else None
 
 
 def horizontal_global_extent(
@@ -472,14 +515,14 @@ def make_nested_grid_context(
     communicator: NestedCommunicator,
     backend: Backend,
     reference: ReferenceMetricData,
+    nest_id: int,
 ) -> NestedGridContext:
     """Construct an independent physical grid context on one nested rank."""
 
-    assert communicator.is_nested_rank
-    nested_rank = communicator.nested_rank
+    nested_rank = communicator.nested_rank(nest_id)
     assert nested_rank is not None
 
-    partitioner = communicator.nested_partitioner
+    partitioner = communicator.nested_partitioners[nest_id]
     fine_nx, fine_ny = partitioner.mapping.fine_extent
 
     sizer = SubtileGridSizer.from_tile_params(
@@ -583,10 +626,12 @@ def check_nested_physical_grid(
 def print_nested_grid_summary(
     communicator: NestedCommunicator,
     context: NestedGridContext | None,
+    nest_id: int,
 ) -> None:
     """Print a compact physical-grid summary from each nested rank."""
 
-    if not communicator.is_nested_rank:
+    nested_rank = communicator.nested_rank(nest_id)
+    if nested_rank is None:
         return
 
     assert context is not None
@@ -595,7 +640,7 @@ def print_nested_grid_summary(
     center_lat = grid.agrid_lon_lat[..., 1]
 
     print(
-        f"nested rank {communicator.nested_rank}: "
+        f"nest {nest_id}, nested rank {nested_rank}: "
         f"mean area={np.mean(np.asarray(grid.area.view[:])):.6e} m^2, "
         f"mean dx={np.mean(np.asarray(grid.dx.view[:])):.6e} m, "
         f"mean dy={np.mean(np.asarray(grid.dy.view[:])):.6e} m, "
@@ -615,7 +660,7 @@ def make_parent_quantity(
     """Allocate one parent test Quantity with the requested staggering."""
 
     assert communicator.is_parent_rank
-    assert communicator.parent_communicator is not None
+    assert communicator.parent_comm is not None
 
     sizer = SubtileGridSizer.from_tile_params(
         nx_tile=PARENT_NX,
@@ -624,7 +669,7 @@ def make_parent_quantity(
         n_halo=N_HALO,
         layout=PARENT_LAYOUT,
         tile_partitioner=communicator.parent_partitioner.tile,
-        tile_rank=communicator.parent_communicator.tile.rank,
+        tile_rank=communicator.parent_comm.tile.rank,
         backend=backend,
     )
     return QuantityFactory(sizer=sizer, backend=backend).zeros(
@@ -646,6 +691,7 @@ def make_nested_quantity(
 def initialize_parent_quantity(
     quantity: Quantity,
     communicator: NestedCommunicator,
+    nest_id: int,
 ) -> None:
     """Fill tile zero with values that encode global horizontal coordinates."""
 
@@ -657,9 +703,11 @@ def initialize_parent_quantity(
     parent_tile = parent_partitioner.tile
     tile_index = parent_partitioner.tile_index(parent_rank)
 
+    mapping = communicator.nested_partitioners[nest_id].mapping
+
     # Only the selected parent tile supplies this nest. Distinct values on the
     # other tiles make accidental cross-tile communication immediately visible.
-    if tile_index != PARENT_TILE:
+    if tile_index != mapping.parent_region:
         quantity.view[:] = -100.0 - parent_rank
         return
 
@@ -718,6 +766,7 @@ def print_nested_quantity_domains(
     communicator: NestedCommunicator,
     fine_quantity: Quantity | None,
     label: str,
+    nest_id: int,
 ) -> None:
     """Print nested compute and halo data in rank order.
 
@@ -727,20 +776,20 @@ def print_nested_quantity_domains(
     the parent domain.
     """
 
-    for rank_to_print in range(communicator.nested_size):
-        communicator.world_comm.Barrier()
+    nested_rank = communicator.nested_rank(nest_id)
+    partitioner = communicator.nested_partitioners[nest_id]
 
-        if not communicator.is_nested_rank:
+    for rank_to_print in range(communicator.nested_size(nest_id)):
+        communicator.comm.Barrier()
+
+        if nested_rank is None:
             continue
-
-        nested_rank = communicator.nested_rank
-        assert nested_rank is not None
 
         if nested_rank != rank_to_print:
             continue
 
         assert fine_quantity is not None
-        j, i = communicator.nested_partitioner.subtile_index(nested_rank)
+        j, i = partitioner.subtile_index(nested_rank)
         logical_data = logical_data_with_halo(fine_quantity, N_HALO)
         compute_data = np.asarray(fine_quantity.view[:])
 
@@ -750,6 +799,7 @@ def print_nested_quantity_domains(
             f"nested Quantity after communication: {label}\n"
             "------------------------------------------------------------\n"
             f"world rank           = {communicator.world_rank}\n"
+            f"nest id              = {nest_id}\n"
             f"nested rank          = {nested_rank}\n"
             f"nested position      = (j={j}, i={i})\n"
             f"dims                 = {tuple(fine_quantity.dims)}\n"
@@ -765,7 +815,7 @@ def print_nested_quantity_domains(
             flush=True,
         )
 
-    communicator.world_comm.Barrier()
+    communicator.comm.Barrier()
 
 
 def print_configuration(communicator: NestedCommunicator) -> None:
@@ -774,31 +824,41 @@ def print_configuration(communicator: NestedCommunicator) -> None:
     if communicator.world_rank != 0:
         return
 
-    mapping = communicator.nested_partitioner.mapping
-    fine_nx, fine_ny = mapping.fine_extent
-
     print(
         "\nNDSL nested-grid example\n"
         f"  parent tile size       = {PARENT_NX} x {PARENT_NY}\n"
         f"  parent layout/tile     = {PARENT_LAYOUT}\n"
-        f"  parent tile/rank       = {mapping.parent_region}/{mapping.parent_rank}\n"
-        f"  nest parent start      = {mapping.parent_start}\n"
-        f"  nest parent extent     = {mapping.parent_extent}\n"
-        f"  refinement ratio       = {mapping.refinement_ratio}\n"
-        f"  nested fine extent     = {fine_nx} x {fine_ny}\n"
-        f"  nested layout          = {communicator.nested_partitioner.layout}\n"
         f"  halo width             = {N_HALO}\n"
-        f"  parent/nested ranks    = {communicator.parent_size}/"
-        f"{communicator.nested_size}",
-        flush=True,
+        f"  parent ranks           = {communicator.parent_size}\n"
     )
+
+    for nest_id in NEST_IDS:
+        partitioner = communicator.nested_partitioners[nest_id]
+        mapping = partitioner.mapping
+        fine_nx, fine_ny = mapping.fine_extent
+
+        print(
+            f"\n  nest {nest_id}\n"
+            f"    parent tile_rank       ="
+            f"{mapping.parent_region}/{mapping.parent_rank}\n"
+            f"    nest parent start      = {mapping.parent_start}\n"
+            f"    nest parent extent     = {mapping.parent_extent}\n"
+            f"    refinement ratio       = {mapping.refinement_ratio}\n"
+            f"    nested fine extent     = {fine_nx} x {fine_ny}\n"
+            f"    nested layout          = {partitioner.layout}\n"
+            f"    nested ranks           = "
+            f"{communicator.nested_size(nest_id)}/n"
+            f"    world ranks            = "
+            f"{communicator.nested_world_ranks[nest_id]}",
+            flush=True,
+        )
 
 
 def print_rank_mapping(communicator: NestedCommunicator) -> None:
     """Print each world's rank role in the nested decomposition."""
 
     for rank_to_print in range(communicator.world_size):
-        communicator.world_comm.Barrier()
+        communicator.comm.Barrier()
 
         if communicator.world_rank != rank_to_print:
             continue
@@ -813,49 +873,69 @@ def print_rank_mapping(communicator: NestedCommunicator) -> None:
                 flush=True,
             )
         else:
-            nested_rank = communicator.nested_rank
+            if len(communicator.nested_comms) != 1:
+                raise RuntimeError(
+                    "test expects each nested rank to belong to one nest"
+                )
+
+            nest_id = next(iter(communicator.nested_comms))
+
+            nested_rank = communicator.nested_rank(nest_id)
             assert nested_rank is not None
-            j, i = communicator.nested_partitioner.subtile_index(nested_rank)
+            partitioner = communicator.nested_partitioners[nest_id]
+            j, i = partitioner.subtile_index(nested_rank)
             print(
                 f"world rank {communicator.world_rank}: "
-                f"nested rank {nested_rank}, position=(j={j}, i={i})",
+                f"nest {nest_id}, nested rank {nested_rank}, "
+                f"position=(j={j}, i={i})",
                 flush=True,
             )
 
-    communicator.world_comm.Barrier()
+    communicator.comm.Barrier()
 
 
 def check_configuration(communicator: NestedCommunicator) -> None:
     """Check that communicator sizes and nest mapping match this example."""
 
-    mapping = communicator.nested_partitioner.mapping
     expected_parent_size = 6 * PARENT_LAYOUT[0] * PARENT_LAYOUT[1]
     expected_nested_size = NESTED_LAYOUT[0] * NESTED_LAYOUT[1]
 
-    assert mapping.parent_extent == NEST_PARENT_EXTENT
-    assert mapping.refinement_ratio == REFINEMENT_RATIO
-    assert mapping.fine_extent == (
-        NEST_PARENT_EXTENT[0] * REFINEMENT_RATIO,
-        NEST_PARENT_EXTENT[1] * REFINEMENT_RATIO,
-    )
     assert communicator.parent_size == expected_parent_size
-    assert communicator.nested_size == expected_nested_size
-    assert communicator.world_size == expected_parent_size + expected_nested_size
+
+    for nest_id in NEST_IDS:
+        partitioner = communicator.nested_partitioners[nest_id]
+        mapping = partitioner.mapping
+
+        assert mapping.parent_region == NEST_PARENT_REGIONS[nest_id]
+        assert mapping.parent_start == NEST_PARENT_STARTS[nest_id]
+        assert mapping.parent_extent == NEST_PARENT_EXTENTS[nest_id]
+        assert mapping.refinement_ratio == REFINEMENT_RATIO
+        assert mapping.fine_extent == (
+            NEST_PARENT_EXTENTS[nest_id][0] * REFINEMENT_RATIO,
+            NEST_PARENT_EXTENTS[nest_id][1] * REFINEMENT_RATIO,
+        )
+        assert communicator.nested_size(nest_id) == expected_nested_size
+
+    assert communicator.world_size == expected_parent_size + expected_nested_size * len(
+        NEST_IDS
+    )
 
 
 def check_nested_result(
     communicator: NestedCommunicator,
     fine_quantity: Quantity | None,
+    nest_id: int,
 ) -> None:
     """Validate internal fine halos and external parent-provided halos."""
 
-    if not communicator.is_nested_rank:
+    nested_rank = communicator.nested_rank(nest_id)
+
+    if nested_rank is None:
         return
 
     assert fine_quantity is not None
-    nested_rank = communicator.nested_rank
-    assert nested_rank is not None
 
+    partitioner = communicator.nested_partitioners[nest_id]
     data = logical_data_with_halo(fine_quantity, N_HALO)
     expected_shape = (
         fine_quantity.extent[0] + 2 * N_HALO,
@@ -869,8 +949,8 @@ def check_nested_result(
         own_value,
     )
 
-    j, i = communicator.nested_partitioner.subtile_index(nested_rank)
-    ny, nx = communicator.nested_partitioner.layout
+    j, i = partitioner.subtile_index(nested_rank)
+    ny, nx = partitioner.layout
 
     # Internal halo slabs come from neighboring nested ranks. External halo
     # slabs are overwritten by coarse-to-fine communication. Parent tile zero
@@ -920,6 +1000,7 @@ def run_communication_case(
     communicator: NestedCommunicator,
     backend: Backend,
     nested_context: NestedGridContext | None,
+    nest_id: int,
     label: str,
     dims: HorizontalDims,
 ) -> None:
@@ -934,15 +1015,16 @@ def run_communication_case(
             backend=backend,
             dims=dims,
         )
-        initialize_parent_quantity(coarse_quantity, communicator)
+        initialize_parent_quantity(coarse_quantity, communicator, nest_id)
     else:
-        assert nested_context is not None
-        fine_quantity = make_nested_quantity(nested_context, dims)
-        nested_rank = communicator.nested_rank
-        assert nested_rank is not None
-        initialize_nested_quantity(fine_quantity, nested_rank)
+        nested_rank = communicator.nested_rank(nest_id)
 
-    communicator.world_comm.Barrier()
+        if nested_rank is not None:
+            assert nested_context is not None
+            fine_quantity = make_nested_quantity(nested_context, dims)
+            initialize_nested_quantity(fine_quantity, nested_rank)
+
+    communicator.comm.Barrier()
     if communicator.world_rank == 0:
         print(f"\nTesting nested communication: {label}, dims={dims}", flush=True)
 
@@ -950,49 +1032,110 @@ def run_communication_case(
     # first fine-to-fine communication across internal nested boundaries, then
     # parent-to-fine communication across the exterior of the nested patch.
     communicator.update_nested_boundaries(
+        nest_id=nest_id,
         coarse_quantity=coarse_quantity,
         fine_quantity=fine_quantity,
         n_points=N_HALO,
     )
-    check_nested_result(communicator, fine_quantity)
+    check_nested_result(communicator, fine_quantity, nest_id)
     print_nested_quantity_domains(
         communicator=communicator,
         fine_quantity=fine_quantity,
         label=label,
+        nest_id=nest_id,
     )
 
-    if communicator.is_nested_rank:
+    nested_rank = communicator.nested_rank(nest_id)
+
+    if nested_rank is not None:
         assert fine_quantity is not None
         print(
-            f"nested rank {communicator.nested_rank}: {label} PASSED, "
-            f"extent={fine_quantity.extent}",
+            f"nested {nest_id}, nested rank  {nested_rank}: "
+            f"{label} PASSED, extent={fine_quantity.extent}",
             flush=True,
         )
 
-    communicator.world_comm.Barrier()
+    communicator.comm.Barrier()
 
 
 def main() -> None:
     world_comm = MPIComm()
+    world_rank = world_comm.Get_rank()
     backend = Backend("st:numpy:cpu:IJK")
 
     parent_partitioner = CubedSpherePartitioner(
         tile=TilePartitioner(layout=PARENT_LAYOUT)
     )
-    nested_partitioner = NestedPartitioner(
-        layout=NESTED_LAYOUT,
-        mapping=NestMapping(
-            parent_rank=PARENT_RANK,
-            parent_region=PARENT_TILE,
-            parent_start=NEST_PARENT_START,
-            parent_extent=NEST_PARENT_EXTENT,
-            refinement_ratio=REFINEMENT_RATIO,
+    nested_partitioners = {
+        0: NestedPartitioner(
+            layout=NESTED_LAYOUT,
+            mapping=NestMapping(
+                parent_rank=NEST_PARENT_RANKS[0],
+                parent_region=NEST_PARENT_REGIONS[0],
+                parent_start=NEST_PARENT_STARTS[0],
+                parent_extent=NEST_PARENT_EXTENTS[0],
+                refinement_ratio=REFINEMENT_RATIO,
+            ),
         ),
-    )
+        1: NestedPartitioner(
+            layout=NESTED_LAYOUT,
+            mapping=NestMapping(
+                parent_rank=NEST_PARENT_RANKS[1],
+                parent_region=NEST_PARENT_REGIONS[1],
+                parent_start=NEST_PARENT_STARTS[1],
+                parent_extent=NEST_PARENT_EXTENTS[1],
+                refinement_ratio=REFINEMENT_RATIO,
+            ),
+        ),
+    }
+
+    parent_size = parent_partitioner.total_ranks
+
+    nested_world_ranks = {
+        0: tuple(range(24, 28)),
+        1: tuple(range(28, 32)),
+    }
+
+    world_rank = world_comm.Get_rank()
+    is_parent_rank = world_rank < parent_size
+
+    if world_rank < parent_size:
+        color = 0
+        local_nest_id: int | None = None
+    elif world_rank in nested_world_ranks[0]:
+        color = 1
+        local_nest_id = 0
+    elif world_rank in nested_world_ranks[1]:
+        color = 2
+        local_nest_id = 1
+
+    raw_role_comm = world_comm.Split(color=color, key=world_rank)
+
+    role_comm = copy.copy(world_comm)
+    role_comm._comm = raw_role_comm
+
+    parent_comm = None
+    nested_comms: dict[int, NestTileCommunicator] = {}
+
+    if is_parent_rank:
+        parent_comm = CubedSphereCommunicator(
+            comm=role_comm,
+            partitioner=parent_partitioner,
+        )
+    else:
+        assert local_nest_id is not None
+        nested_comms[local_nest_id] = NestTileCommunicator(
+            comm=role_comm,
+            partitioner=nested_partitioners[local_nest_id],
+        )
+
     communicator = NestedCommunicator(
         comm=world_comm,
         parent_partitioner=parent_partitioner,
-        nested_partitioner=nested_partitioner,
+        nested_partitioners=nested_partitioners,
+        nested_world_ranks=nested_world_ranks,
+        parent_comm=parent_comm,
+        nested_comms=nested_comms,
     )
 
     check_configuration(communicator)
@@ -1037,34 +1180,48 @@ def main() -> None:
             ),
         )
 
-    check_physical_refinement(
-        communicator=communicator,
-        coarse_metrics=coarse_metric_terms,
-        fine_metrics=fine_reference_metric_terms,
-    )
+    for nest_id in NEST_IDS:
+        check_physical_refinement(
+            communicator=communicator,
+            coarse_metrics=coarse_metric_terms,
+            fine_metrics=fine_reference_metric_terms,
+            nest_id=nest_id,
+        )
 
     # Gather a higher-resolution physical reference tile and make it available
     # to the nested ranks. This broadcast is example setup, not part of the
     # nested boundary-exchange API being tested below.
-    reference_data = get_reference_metric_data(
-        communicator=communicator,
-        fine_metrics=fine_reference_metric_terms,
-    )
-    reference_data = communicator.world_comm.bcast(
-        reference_data,
-        root=PARENT_RANK,
-    )
+    reference_data_by_nest = {}
+
+    for nest_id in NEST_IDS:
+        reference_data_by_nest[nest_id] = get_reference_metric_data(
+            communicator=communicator,
+            fine_metrics=fine_reference_metric_terms,
+            nest_id=nest_id,
+        )
+        reference_data_by_nest[nest_id] = communicator.comm.bcast(
+            reference_data_by_nest[nest_id],
+            root=NEST_PARENT_RANKS[nest_id],
+        )
 
     nested_context: NestedGridContext | None = None
     if communicator.is_nested_rank:
+        assert local_nest_id is not None
+        reference = reference_data_by_nest[local_nest_id]
+        assert reference is not None
+
         nested_context = make_nested_grid_context(
             communicator=communicator,
             backend=backend,
-            reference=reference_data,
+            reference=reference,
+            nest_id=local_nest_id,
         )
 
     check_nested_physical_grid(communicator, nested_context)
-    print_nested_grid_summary(communicator, nested_context)
+
+    if communicator.is_nested_rank:
+        assert local_nest_id is not None
+        print_nested_grid_summary(communicator, nested_context, local_nest_id)
 
     # A-grid cell centers plus the two horizontal interface staggerings cover
     # the scalar storage patterns needed by A-, C-, and D-grid fields without
@@ -1074,14 +1231,16 @@ def main() -> None:
         ("I-interface", (I_INTERFACE_DIM, J_DIM)),
         ("J-interface", (I_DIM, J_INTERFACE_DIM)),
     )
-    for label, dims in staggerings:
-        run_communication_case(
-            communicator=communicator,
-            backend=backend,
-            nested_context=nested_context,
-            label=label,
-            dims=dims,
-        )
+    for nest_id in NEST_IDS:
+        for label, dims in staggerings:
+            run_communication_case(
+                communicator=communicator,
+                backend=backend,
+                nested_context=(nested_context if local_nest_id == nest_id else None),
+                nest_id=nest_id,
+                label=label,
+                dims=dims,
+            )
 
     if communicator.world_rank == 0:
         print("\nA/C/D nested-grid communication PASSED", flush=True)

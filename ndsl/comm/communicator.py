@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import abc
-import copy
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from types import ModuleType
 from typing import Any, Generic, Self, TypeVar, cast
 
@@ -55,29 +54,6 @@ def to_numpy(array, dtype=None) -> np.ndarray:  # type: ignore[no-untyped-def]
 
 
 P = TypeVar("P", bound=Partitioner)
-
-class GridHierarchyCommunicator:
-    def __init__(
-        self,
-        world_comm: CommABC,
-        parent_comm: Communicator | None = None,
-        nested_comms: Mapping[int, Communicator] | None = None,
-    ) -> None:
-        self.world_comm = world_comm
-        self.parent_comm = parent_comm
-        self.nested_comms = (
-                dict(nested_comms)
-                if nested_comms is not None
-                else {}
-        )
-
-    @property
-    def rank(self) -> int:
-        return self.world_comm.Get_rank()
-
-    @property
-    def size(self) -> int:
-        return self.world_comm.Get_size()
 
 
 class Communicator(abc.ABC, Generic[P]):
@@ -896,8 +872,8 @@ class CubedSphereCommunicator(Communicator[CubedSpherePartitioner]):
         return recv_quantity
 
 
-class NestedGridCommunicator(Communicator[NestedPartitioner]):
-    """Communicator for ranks belonging to one nested grid patch."""
+class NestTileCommunicator(Communicator[NestedPartitioner]):
+    """Communicator for one nested grid tile."""
 
     @classmethod
     def from_layout(
@@ -906,152 +882,123 @@ class NestedGridCommunicator(Communicator[NestedPartitioner]):
         layout: tuple[int, int],
         force_cpu: bool = False,
         timer: Timer | None = None,
-    ) -> NestedGridCommunicator:
+    ) -> NestTileCommunicator:
         raise NotImplementedError(
-            "NestedGridCommunicator requires an existing NestedPartitioner"
+            "NestTileCommunicator requires an existing NestedPartitioner"
         )
 
     @property
-    def tile(self) -> NestedGridCommunicator:
+    def tile(self) -> NestTileCommunicator:
         return self
 
 
-class NestedCommunicator(GridHierarchyCommunicator):
-    """Coordinate a parent domain and one nested fine-grid patch.
-
-    World ranks are assigned contiguously, with parent ranks first followed by
-    nested ranks.
-    """
+class NestedCommunicator:
+    """Coordinate a parent domain and one nested fine-grid patch."""
 
     def __init__(
         self,
         comm: CommABC,
         parent_partitioner: Partitioner,
-        nested_partitioner: NestedPartitioner,
+        nested_partitioners: Mapping[int, NestedPartitioner],
+        nested_world_ranks: Mapping[int, Sequence[int]],
+        parent_comm: Communicator | None = None,
+        nested_comms: Mapping[int, NestTileCommunicator] | None = None,
         force_cpu: bool = False,
         timer: Timer | None = None,
-        parent_communicator_factory: Callable[..., Communicator] | None = None,
     ) -> None:
-        if not issubclass(type(comm), CommABC):
-            raise TypeError(
-                "NestedCommunicator requires a CommABC communication "
-                f"subsystem, got {type(comm)}."
-            )
-
-        self.world_comm = comm
-        self.comm = self.world_comm
+        self.comm = comm
+        self.parent_comm = parent_comm
+        self.nested_comms = dict(nested_comms) if nested_comms is not None else {}
 
         self.parent_partitioner = parent_partitioner
-        self.nested_partitioner = nested_partitioner
+        self.nested_partitioners = dict(nested_partitioners)
+        self.nested_world_ranks = {
+            nest_id: tuple(world_ranks)
+            for nest_id, world_ranks in nested_world_ranks.items()
+        }
 
         self._force_cpu = force_cpu
         self.timer = timer if timer is not None else NullTimer()
         self._last_halo_tag = 0
 
-        self.world_rank = comm.Get_rank()
-        self.world_size = comm.Get_size()
+        self.world_rank = self.comm.Get_rank()
+        self.world_size = self.comm.Get_size()
+        self.parent_size = self.parent_partitioner.total_ranks
 
-        self.parent_size = parent_partitioner.total_ranks
-        self.nested_size = nested_partitioner.total_ranks
-
-        required_size = self.parent_size + self.nested_size
-        if self.world_size != required_size:
+        if set(self.nested_partitioners) != set(self.nested_world_ranks):
             raise ValueError(
-                f"NestedCommunicator requires exactly {required_size} world ranks: "
-                f"{self.parent_size} parent + {self.nested_size} nested. "
-                f"Got {self.world_size}."
+                "nested_partitioners and nested_world_ranks must "
+                "contain the same nest ID's"
             )
 
-        self.is_parent_rank = self.world_rank < self.parent_size
-        self.is_nested_rank = not self.is_parent_rank
+        for nest_id, partitioner in self.nested_partitioners.items():
+            world_ranks = self.nested_world_ranks[nest_id]
 
-        raw_role_comm = self.world_comm.Split(
-            color=0 if self.is_parent_rank else 1,
-            key=self.world_rank,
-        )
-
-        role_comm = copy.copy(self.world_comm)
-        role_comm._comm = raw_role_comm
-
-        self.parent_mpi_comm: CommABC | None = None
-        self.nested_mpi_comm: CommABC | None = None
-
-        self.parent_communicator: Communicator | None = None
-        self.nested_communicator: NestedGridCommunicator | None = None
-
-        if self.is_parent_rank:
-            self.parent_mpi_comm = role_comm
-
-            if parent_communicator_factory is None:
-                self.parent_communicator = self._build_default_parent_communicator(
-                    comm=self.parent_mpi_comm,
-                    partitioner=self.parent_partitioner,
+            if len(world_ranks) != partitioner.total_ranks:
+                raise ValueError(
+                    f"nested domain {nest_id} requires {partitioner.total_ranks} ranks, "
+                    f"got {len(world_ranks)} world ranks"
                 )
-            else:
-                self.parent_communicator = parent_communicator_factory(
-                    self.parent_mpi_comm,
-                    self.parent_partitioner,
-                    force_cpu,
-                    self.timer,
-                )
-        else:
-            self.nested_mpi_comm = role_comm
-            self.nested_communicator = NestedGridCommunicator(
-                comm=self.nested_mpi_comm,
-                partitioner=self.nested_partitioner,
-                force_cpu=force_cpu,
-                timer=self.timer,
+
+            for world_rank in world_ranks:
+                if world_rank < 0 or world_rank >= self.world_size:
+                    raise ValueError(
+                        f"nested domain {nest_id} contains invalid world rank "
+                        f"{world_rank} for world size {self.world_size}"
+                    )
+
+    @property
+    def rank(self) -> int:
+        return self.comm.Get_rank()
+
+    @property
+    def size(self) -> int:
+        return self.comm.Get_size()
+
+    @property
+    def is_parent_rank(self) -> bool:
+        return self.parent_comm is not None
+
+    @property
+    def is_nested_rank(self) -> bool:
+        return bool(self.nested_comms)
+
+    @property
+    def parent_rank(self) -> int | None:
+        if self.parent_comm is None:
+            return None
+        return self.parent_comm.rank  # CHANGE: this only works for CubedSphere
+
+    def nested_rank(self, nest_id: int) -> int | None:
+        nested_comm = self.nested_comms.get(nest_id)
+
+        if nested_comm is None:
+            return None
+
+        return nested_comm.rank
+
+    def nested_size(self, nest_id: int) -> int:
+        return self.nested_partitioners[nest_id].total_ranks
+
+    def _nested_partitioner(self, nest_id: int) -> NestedPartitioner:
+        try:
+            return self.nested_partitioners[nest_id]
+        except KeyError as err:
+            raise ValueError(f"unknown nested domain {nest_id}") from err
+
+    def _nested_world_rank(self, nest_id: int, nested_rank: int) -> int:
+        try:
+            world_ranks = self.nested_world_ranks[nest_id]
+        except KeyError as err:
+            raise ValueError(f"unknown nested domain {nest_id}") from err
+
+        if nested_rank < 0 or nested_rank >= len(world_ranks):
+            raise ValueError(
+                f"nested rank {nested_rank} is outside nested "
+                f"domain {nest_id} of size {len(world_ranks)}"
             )
 
-        super().__init__(
-            world_comm=self.world_comm,
-            parent_comm=self.parent_communicator,
-            nested_comms=(
-                {0: self.nested_communicator}
-                if self.nested_communicator is not None
-                else None
-            ),
-        )
-
-
-    def _build_default_parent_communicator(
-        self,
-        comm: CommABC,
-        partitioner: Partitioner,
-    ) -> Communicator:
-        if isinstance(partitioner, CubedSpherePartitioner):
-            return CubedSphereCommunicator(
-                comm=comm,
-                partitioner=partitioner,
-                force_cpu=self._force_cpu,
-                timer=self.timer,
-            )
-
-        if isinstance(partitioner, TilePartitioner):
-            return TileCommunicator(
-                comm=comm,
-                partitioner=partitioner,
-                force_cpu=self._force_cpu,
-                timer=self.timer,
-            )
-
-        raise TypeError(
-            "No default communicator is known for parent partitioner "
-            f"{type(partitioner)}. Supply parent_communicator_factory."
-        )
-
-    def _parent_tile_partitioner(self) -> TilePartitioner:
-        if isinstance(self.parent_partitioner, CubedSpherePartitioner):
-            return self.parent_partitioner.tile
-
-        if isinstance(self.parent_partitioner, TilePartitioner):
-            return self.parent_partitioner
-
-        raise TypeError(
-            "coarse-to-fine communication currently supports "
-            "TilePartitioner or CubedSpherePartitioner parents, "
-            f"got {type(self.parent_partitioner)}"
-        )
+        return world_ranks[nested_rank]
 
     @staticmethod
     def _horizontal_axes(dims: Sequence[str]) -> tuple[int, int]:
@@ -1066,35 +1013,25 @@ class NestedCommunicator(GridHierarchyCommunicator):
 
         return i_axes[0], j_axes[0]
 
-    @property
-    def parent_rank(self) -> int | None:
-        if self.parent_mpi_comm is None:
-            return None
-        return self.parent_mpi_comm.Get_rank()
-
-    @property
-    def nested_rank(self) -> int | None:
-        if self.nested_mpi_comm is None:
-            return None
-        return self.nested_mpi_comm.Get_rank()
-
     def update_nested_halo(
         self,
+        nest_id: int,
         fine_quantity: Quantity | None,
         n_points: int,
     ) -> None:
-        """Perform same-resolution fine-to-fine halo communication."""
-        if not self.is_nested_rank:
+        """Perform same-resolution halo communication within one nest."""
+        nested_comm = self.nested_comms.get(nest_id)
+
+        if nested_comm is None:
             return
 
         if fine_quantity is None:
-            raise ValueError("fine_quantity is required on nested ranks")
+            raise ValueError(
+                "fine_quantity is required on ranks participating"
+                f"in nested domain {nest_id}"
+            )
 
-        assert self.nested_communicator is not None
-        self.nested_communicator.halo_update(
-            fine_quantity,
-            n_points=n_points,
-        )
+        nested_comm.halo_update(fine_quantity, n_points=n_points)
 
     def _parent_quantity_geometry(
         self,
@@ -1102,21 +1039,28 @@ class NestedCommunicator(GridHierarchyCommunicator):
         anchor_parent_rank: int,
     ) -> tuple[tuple[str, ...], tuple[int, ...]]:
         parent_info = None
+        anchor_world_rank = anchor_parent_rank
 
         if self.world_rank == anchor_parent_rank:
+            if self.parent_comm is None:
+                raise RuntimeError(
+                    "NestMapping anchor rank does not participate "
+                    "in the parent communicator"
+                )
+
             if coarse_quantity is None:
                 raise ValueError(
                     "coarse_quantity must be supplied on the "
                     "NestMapping anchor parent rank"
                 )
 
-            parent_tile = self._parent_tile_partitioner()
+            parent_tile = self.parent_comm.tile
             parent_info = (
                 tuple(coarse_quantity.dims),
-                tuple(parent_tile.global_extent(coarse_quantity.metadata)),
+                tuple(parent_tile.partitioner.global_extent(coarse_quantity.metadata)),
             )
 
-        parent_info = self.world_comm.bcast(
+        parent_info = self.comm.bcast(
             parent_info,
             root=anchor_parent_rank,
         )
@@ -1130,27 +1074,43 @@ class NestedCommunicator(GridHierarchyCommunicator):
 
     def _nested_quantity_geometry(
         self,
+        nest_id: int,
         fine_quantity: Quantity | None,
     ) -> tuple[tuple[str, ...], tuple[int, ...]]:
-        fine_anchor_world_rank = self.parent_size
+        nested_partitioner = self._nested_partitioner(nest_id)
+        fine_anchor_world_rank = self._nested_world_rank(nest_id, 0)
         fine_info = None
 
         if self.world_rank == fine_anchor_world_rank:
+            nested_comm = self.nested_comms.get(nest_id)
+
+            if nested_comm is None:
+                raise RuntimeError(
+                    f"rank zero of nested domain {nest_id} "
+                    "does not have its NestTileCommunicator"
+                )
+
             if fine_quantity is None:
-                raise ValueError("fine_quantity must be supplied on nested rank zero")
+                raise ValueError(
+                    f"fine_quantity must be supplied on nested rank zero "
+                    f"of nested domain {nest_id}"
+                )
 
             fine_info = (
                 tuple(fine_quantity.dims),
-                tuple(self.nested_partitioner.global_extent(fine_quantity.metadata)),
+                tuple(nested_partitioner.global_extent(fine_quantity.metadata)),
             )
 
-        fine_info = self.world_comm.bcast(
+        fine_info = self.comm.bcast(
             fine_info,
             root=fine_anchor_world_rank,
         )
 
         if fine_info is None:
-            raise RuntimeError("Failed to broadcast nested quantity geometry")
+            raise RuntimeError(
+                f"Failed to broadcast nested quantity geometry"
+                f"for nested domain {nest_id}"
+            )
 
         dims = tuple(fine_info[0])
         extent = tuple(int(value) for value in fine_info[1])
@@ -1158,6 +1118,7 @@ class NestedCommunicator(GridHierarchyCommunicator):
 
     def _collect_coarse_to_fine_exchanges(
         self,
+        nest_id: int,
         parent_tile_extent: tuple[int, ...],
         fine_global_extent: tuple[int, ...],
         dims: tuple[str, ...],
@@ -1170,25 +1131,30 @@ class NestedCommunicator(GridHierarchyCommunicator):
         boundaries: list[Boundary] = []
         peer_plans: dict[int, list[CoarseToFineExchangePlan]] = {}
         peer_boundaries: dict[int, list[Boundary]] = {}
+        nested_ranks_to_process: Sequence[int]
+        nested_partitioner = self._nested_partitioner(nest_id)
 
         if self.is_parent_rank:
-            nested_ranks_to_process = range(self.nested_size)
+            nested_ranks_to_process = range(nested_partitioner.total_ranks)
         else:
-            nested_rank = self.nested_rank
-            assert nested_rank is not None
+            nested_rank = self.nested_rank(nest_id)
+
+            if nested_rank is None:
+                return boundaries, peer_plans, peer_boundaries
+
             nested_ranks_to_process = (nested_rank,)
 
         for nested_rank in nested_ranks_to_process:
-            nested_world_rank = self.parent_size + nested_rank
+            nested_world_rank = self._nested_world_rank(nest_id, nested_rank)
             external_boundaries = set(
-                self.nested_partitioner.external_boundary_types(nested_rank)
+                nested_partitioner.external_boundary_types(nested_rank)
             )
 
             for boundary_type in constants.BOUNDARY_TYPES:
                 if boundary_type not in external_boundaries:
                     continue
 
-                exchanges = self.nested_partitioner.coarse_to_fine_boundaries(
+                exchanges = nested_partitioner.coarse_to_fine_boundaries(
                     parent_partitioner=self.parent_partitioner,
                     parent_tile_extent=parent_tile_extent,
                     fine_global_extent=fine_global_extent,
@@ -1332,7 +1298,7 @@ class NestedCommunicator(GridHierarchyCommunicator):
                 transport_size = 0
 
                 for plan, window in zip(plans, windows):
-                    fine_shape = self._window_shape(window)
+                    fine_shape = list(self._window_shape(window))
 
                     if (
                         fine_shape[i_axis] != plan.fine_extent[0]
@@ -1355,6 +1321,7 @@ class NestedCommunicator(GridHierarchyCommunicator):
 
     def coarse_to_fine(
         self,
+        nest_id: int,
         coarse_quantity: Quantity | None,
         fine_quantity: Quantity | None,
         n_points: int,
@@ -1367,7 +1334,8 @@ class NestedCommunicator(GridHierarchyCommunicator):
         if n_points <= 0:
             raise ValueError("n_points must be positive")
 
-        anchor_parent_rank = self.nested_partitioner.mapping.parent_rank
+        nested_partitioner = self._nested_partitioner(nest_id)
+        anchor_parent_rank = nested_partitioner.mapping.parent_rank
         if anchor_parent_rank >= self.parent_size:
             raise ValueError(
                 f"NestMapping parent_rank={anchor_parent_rank} is outside "
@@ -1378,7 +1346,10 @@ class NestedCommunicator(GridHierarchyCommunicator):
             coarse_quantity,
             anchor_parent_rank,
         )
-        fine_dims, fine_global_extent = self._nested_quantity_geometry(fine_quantity)
+        fine_dims, fine_global_extent = self._nested_quantity_geometry(
+            nest_id,
+            fine_quantity,
+        )
 
         if parent_dims != fine_dims:
             raise ValueError(
@@ -1390,6 +1361,7 @@ class NestedCommunicator(GridHierarchyCommunicator):
 
         boundaries, peer_plans, peer_boundaries = (
             self._collect_coarse_to_fine_exchanges(
+                nest_id=nest_id,
                 parent_tile_extent=parent_tile_extent,
                 fine_global_extent=fine_global_extent,
                 dims=dims,
@@ -1412,8 +1384,17 @@ class NestedCommunicator(GridHierarchyCommunicator):
                 )
             quantity = coarse_quantity
         else:
+            nested_rank = self.nested_rank(nest_id)
+
+            if nested_rank is None:
+                return
+
             if fine_quantity is None:
-                raise ValueError("fine_quantity is required on nested ranks")
+                raise ValueError(
+                    f"fine_quantity is required on ranks"
+                    f"participating in nested domain {nest_id}"
+                )
+
             quantity = fine_quantity
 
         if tuple(quantity.dims) != dims:
@@ -1434,7 +1415,7 @@ class NestedCommunicator(GridHierarchyCommunicator):
         )
 
         updater = HaloUpdater.from_scalar_specifications(
-            comm=self,
+            comm=cast(Communicator[Any], self),
             numpy_like_module=self._maybe_force_cpu(quantity.np),
             specifications=[specification],
             boundaries=boundaries,
@@ -1448,6 +1429,7 @@ class NestedCommunicator(GridHierarchyCommunicator):
 
     def update_nested_boundaries(
         self,
+        nest_id: int,
         coarse_quantity: Quantity | None,
         fine_quantity: Quantity | None,
         n_points: int,
@@ -1458,11 +1440,13 @@ class NestedCommunicator(GridHierarchyCommunicator):
         values are written into the external nested-grid halos.
         """
         self.update_nested_halo(
+            nest_id=nest_id,
             fine_quantity=fine_quantity,
             n_points=n_points,
         )
 
         self.coarse_to_fine(
+            nest_id=nest_id,
             coarse_quantity=coarse_quantity,
             fine_quantity=fine_quantity,
             n_points=n_points,
@@ -1471,21 +1455,6 @@ class NestedCommunicator(GridHierarchyCommunicator):
     def _get_halo_tag(self) -> int:
         self._last_halo_tag += 1
         return self._last_halo_tag
-
-    def __getattr__(self, name: str):
-        """Delegate parent-domain operations on parent ranks."""
-        parent_communicator = object.__getattribute__(
-            self,
-            "parent_communicator",
-        )
-
-        if parent_communicator is None:
-            raise AttributeError(
-                f"Nested world rank {self.world_rank} cannot access "
-                f"parent communicator attribute {name!r}."
-            )
-
-        return getattr(parent_communicator, name)
 
     def _device_synchronize(self) -> None:
         Communicator._device_synchronize()

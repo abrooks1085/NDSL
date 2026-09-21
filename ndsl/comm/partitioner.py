@@ -734,11 +734,12 @@ class CubedSpherePartitioner(Partitioner):
         )
 
 
-class NestedPartitioner(Partitioner):
+class NestedPartitioner(TilePartitioner):
     """Partition a single non-periodic nested grid region.
 
     Internal boundaries connect nested ranks. Boundaries on the exterior of
     the nested region return None and are supplied by coarse-to-fine updates.
+    The mapping describes the nested region's placement within its parent grid.
     """
 
     def __init__(
@@ -746,66 +747,15 @@ class NestedPartitioner(Partitioner):
         layout: tuple[int, int],
         mapping: NestMapping,
     ) -> None:
+
+        super().__init__(layout=layout)
         self.mapping = mapping
-
-        # Reuse TilePartitioner decomposition without its periodic topology.
-        super().__init__(
-            tile=TilePartitioner(layout),
-            layout=layout,
-        )
-
-    @property
-    def total_ranks(self) -> int:
-        return self.layout[0] * self.layout[1]
 
     @property
     def fine_extent(self) -> tuple[int, int]:
         return self.mapping.fine_extent
 
-    def tile_index(self, rank: int) -> int:
-        """Return the logical region index for a nested rank."""
-        if rank < 0 or rank >= self.total_ranks:
-            raise ValueError(
-                f"rank {rank} is outside nested communicator "
-                f"of size {self.total_ranks}"
-            )
-        return 0
-
-    def subtile_index(self, rank: int) -> tuple[int, int]:
-        return self.tile.subtile_index(rank)
-
-    def global_extent(
-        self,
-        rank_metadata: QuantityMetadata,
-    ) -> tuple[int, ...]:
-        return self.tile.global_extent(rank_metadata)
-
-    def subtile_extent(
-        self,
-        metadata: QuantityMetadata,
-        rank: int,
-    ) -> tuple[int, ...]:
-        return self.tile.subtile_extent(metadata, rank)
-
-    def subtile_slice(
-        self,
-        rank: int,
-        global_dims: Sequence[str],
-        global_extent: Sequence[int],
-        overlap: bool = False,
-    ) -> tuple[int | slice, ...]:
-        return self.tile.subtile_slice(
-            rank=rank,
-            global_dims=global_dims,
-            global_extent=global_extent,
-            overlap=overlap,
-        )
-
-    def boundary(
-        self,
-        boundary_type: int,
-        rank: int,
-    ) -> bd.SimpleBoundary | None:
+    def boundary(self, boundary_type: int, rank: int) -> bd.SimpleBoundary | None:
         """Return a fine-to-fine boundary or None at the nest exterior."""
         j, i = self.subtile_index(rank)
         ny, nx = self.layout
@@ -835,17 +785,10 @@ class NestedPartitioner(Partitioner):
             n_clockwise_rotations=0,
         )
 
-    def is_external_boundary(
-        self,
-        boundary_type: int,
-        rank: int,
-    ) -> bool:
+    def is_external_boundary(self, boundary_type: int, rank: int) -> bool:
         return self.boundary(boundary_type, rank) is None
 
-    def external_boundary_types(
-        self,
-        rank: int,
-    ) -> tuple[int, ...]:
+    def external_boundary_types(self, rank: int) -> tuple[int, ...]:
         return tuple(
             boundary_type
             for boundary_type in constants.BOUNDARY_TYPES
@@ -853,9 +796,7 @@ class NestedPartitioner(Partitioner):
         )
 
     @staticmethod
-    def _horizontal_axes(
-        dims: Sequence[str],
-    ) -> tuple[int, int]:
+    def _horizontal_axes(dims: Sequence[str]) -> tuple[int, int]:
         i_axes = [index for index, dim in enumerate(dims) if dim in constants.I_DIMS]
         j_axes = [index for index, dim in enumerate(dims) if dim in constants.J_DIMS]
 
@@ -1165,18 +1106,6 @@ class NestedPartitioner(Partitioner):
             result.append((plan, coarse_boundary, fine_boundary))
 
         return tuple(result)
-
-    def on_tile_bottom(self, rank: int) -> bool:
-        return self.tile.on_tile_bottom(rank)
-
-    def on_tile_top(self, rank: int) -> bool:
-        return self.tile.on_tile_top(rank)
-
-    def on_tile_left(self, rank: int) -> bool:
-        return self.tile.on_tile_left(rank)
-
-    def on_tile_right(self, rank: int) -> bool:
-        return self.tile.on_tile_right(rank)
 
 
 def on_tile_left(subtile_index: tuple[int, int]) -> bool:
