@@ -12,10 +12,6 @@ from ndsl.buffer import Buffer
 from ndsl.comm import Comm
 from ndsl.comm.boundary import Boundary
 from ndsl.halo.data_transformer import HaloDataTransformer, HaloExchangeSpec
-from ndsl.halo.exchange_transform import (
-    HaloExchangeTransform,
-    IdentityHaloExchangeTransform,
-)
 from ndsl.halo.rotate import rotate_scalar_data
 from ndsl.performance.timer import NullTimer, Timer
 from ndsl.quantity import Quantity, QuantityHaloSpec
@@ -55,8 +51,8 @@ class HaloUpdater:
         tag: int,
         transformers: dict[int, HaloDataTransformer],
         timer: Timer,
-        exchange_transforms: Mapping[int, HaloExchangeTransform] | None = None,
         peer_directions: Mapping[int, tuple[bool, bool]] | None = None,
+        peer_boundary_counts: Mapping[int, int] | None = None,
     ):
         """Build the updater.
 
@@ -66,31 +62,20 @@ class HaloUpdater:
             transformers: mapping from destination rank to transformers used to
                 pack/unpack before and after communication
             timer: timing operations
-            exchange_transforms: optional transport transform for each peer rank.
             peer_directions: maps peer rank -> (does_send, does_recv).
+            peer_boundary_counts: number of exchange boundaries represented by each
+                peer's data transformer.
         """
         self._comm = comm
         self._tag = tag
         self._transformers = transformers
         self._timer = timer
 
-        if exchange_transforms is None:
-            exchange_transforms = {}
+        if peer_boundary_counts is None:
+            peer_boundary_counts = {}
 
-        unknown_ranks = set(exchange_transforms) - set(transformers)
-
-        if unknown_ranks:
-            raise ValueError(
-                "Halo exchange transforms supplied for ranks "
-                f"without data transformers: {unknown_ranks}"
-            )
-
-        self._exchange_transforms = {
-            rank: exchange_transforms.get(
-                rank,
-                IdentityHaloExchangeTransform(),
-            )
-            for rank in transformers
+        self._peer_boundary_counts = {
+            rank: peer_boundary_counts.get(rank, 1) for rank in transformers
         }
 
         if peer_directions is None:
@@ -147,8 +132,6 @@ class HaloUpdater:
         if not self._finalize_on_wait:
             for transformer in self._transformers.values():
                 transformer.finalize()
-            for transform in self._exchange_transforms.values():
-                transform.finalize()
 
     @classmethod
     def from_scalar_specifications(
@@ -159,7 +142,6 @@ class HaloUpdater:
         boundaries: Iterable[Boundary],
         tag: int,
         optional_timer: Timer | None = None,
-        exchange_transforms: Mapping[int, HaloExchangeTransform] | None = None,
     ) -> HaloUpdater:
         """
         Create/retrieve as many packed buffer as needed and
@@ -173,7 +155,6 @@ class HaloUpdater:
             boundaries: information on the exchange boundaries.
             tag: network tag (to differentiate messaging) for this node.
             optional_timer: timing of operations.
-            exchange_transforms: optional transport transforms keyed by peer rank.
 
         Returns:
             HaloUpdater ready to exchange data.
@@ -188,9 +169,10 @@ class HaloUpdater:
 
         # Sort the specification per target rank
         exchange_specs_dict = defaultdict(list)
+        peer_boundary_counts: defaultdict[int, int] = defaultdict(int)
+
         for boundary in boundaries:
-            if not (boundary.does_send() or boundary.does_recv()):
-                continue
+            peer_boundary_counts[boundary.to_rank] += 1
             for specification in specifications:
                 exchange_specs_dict[boundary.to_rank].append(
                     HaloExchangeSpec(
@@ -214,8 +196,8 @@ class HaloUpdater:
             tag,
             transformers,
             timer,
-            exchange_transforms=exchange_transforms,
             peer_directions=peer_directions,
+            peer_boundary_counts=peer_boundary_counts,
         )
 
     @classmethod
@@ -228,7 +210,6 @@ class HaloUpdater:
         boundaries: Iterable[Boundary],
         tag: int,
         optional_timer: Timer | None = None,
-        exchange_transforms: Mapping[int, HaloExchangeTransform] | None = None,
     ) -> HaloUpdater:
         """
         Create/retrieve as many packed buffer as needed and queue
@@ -244,21 +225,23 @@ class HaloUpdater:
             boundaries: information on the exchange boundaries.
             tag: network tag (to differentiate messaging) for this node.
             optional_timer: timing of operations.
-            exchange_transforms: optional transport transforms keyed by peer rank.
 
         Returns:
             HaloUpdater ready to exchange data.
         """
         timer = optional_timer if optional_timer is not None else NullTimer()
 
+        specifications_x = tuple(specifications_x)
+        specifications_y = tuple(specifications_y)
+
         boundaries = tuple(boundaries)
         peer_directions = cls._directions_from_boundaries(boundaries)
 
         exchange_descriptors_x = defaultdict(list)
         exchange_descriptors_y = defaultdict(list)
+        peer_boundary_counts: defaultdict[int, int] = defaultdict(int)
         for boundary in boundaries:
-            if not (boundary.does_send() or boundary.does_recv()):
-                continue
+            peer_boundary_counts[boundary.to_rank] += 1
             for specification_x, specification_y in zip(
                 specifications_x, specifications_y
             ):
@@ -294,8 +277,8 @@ class HaloUpdater:
             tag,
             transformers,
             timer,
-            exchange_transforms=exchange_transforms,
             peer_directions=peer_directions,
+            peer_boundary_counts=peer_boundary_counts,
         )
 
     def update(
@@ -333,8 +316,7 @@ class HaloUpdater:
                 _does_send, does_recv = self._peer_directions[to_rank]
                 if not does_recv:
                     continue
-                exchange_transform = self._exchange_transforms[to_rank]
-                recv_buffer = exchange_transform.get_recv_buffer(transformer)
+                recv_buffer = transformer.get_unpack_buffer()
                 self._recv_requests.append(
                     self._comm.comm.Irecv(
                         recv_buffer.array,
@@ -349,10 +331,16 @@ class HaloUpdater:
                 does_send, _does_recv = self._peer_directions[to_rank]
                 if not does_send:
                     continue
-                self._exchange_transforms[to_rank].async_pack(
-                    transformer,
-                    quantities_x,
-                    quantities_y,
+                boundary_count = self._peer_boundary_counts[to_rank]
+                # Exchange specifications are grouped by boundary for each peer, so the
+                # runtime quantities are repeated once per boundary to match that ordering.
+                peer_quantities_x = quantities_x * boundary_count
+                peer_quantities_y = (
+                    quantities_y * boundary_count if quantities_y is not None else None
+                )
+                transformer.async_pack(
+                    peer_quantities_x,
+                    peer_quantities_y,
                 )
 
         self._inflight_x_quantities = tuple(quantities_x)
@@ -367,8 +355,7 @@ class HaloUpdater:
                 does_send, _ = self._peer_directions[to_rank]
                 if not does_send:
                     continue
-                exchange_transform = self._exchange_transforms[to_rank]
-                send_buffer = exchange_transform.get_send_buffer(transformer)
+                send_buffer = transformer.get_pack_buffer()
                 self._send_requests.append(
                     self._comm.comm.Isend(
                         send_buffer.array,
@@ -402,22 +389,24 @@ class HaloUpdater:
                 _does_send, does_recv = self._peer_directions[to_rank]
                 if not does_recv:
                     continue
-                exchange_transform = self._exchange_transforms[to_rank]
-                exchange_transform.async_unpack(
-                    transformer,
-                    self._inflight_x_quantities,
-                    self._inflight_y_quantities,
+                boundary_count = self._peer_boundary_counts[to_rank]
+
+                peer_quantities_x = list(self._inflight_x_quantities) * boundary_count
+                peer_quantities_y = (
+                    list(self._inflight_y_quantities) * boundary_count
+                    if self._inflight_y_quantities is not None
+                    else None
+                )
+                transformer.async_unpack(
+                    peer_quantities_x,
+                    peer_quantities_y,
                 )
             if self._finalize_on_wait:
                 for transformer in self._transformers.values():
                     transformer.finalize()
-                for transform in self._exchange_transforms.values():
-                    transform.finalize()
             else:
                 for transformer in self._transformers.values():
                     transformer.synchronize()
-                for transform in self._exchange_transforms.values():
-                    transform.synchronize()
 
         self._inflight_x_quantities = None
         self._inflight_y_quantities = None
@@ -440,9 +429,6 @@ class HaloUpdater:
                 boundary.does_send(),
                 boundary.does_recv(),
             )
-
-            if not any(direction):
-                continue
 
             rank = boundary.to_rank
             previous = directions.get(rank)

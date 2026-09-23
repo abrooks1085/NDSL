@@ -8,7 +8,7 @@ from ndsl.quantity import Quantity, QuantityHaloSpec
 
 
 class CommType(Enum):
-    """Communication direction for a boundary."""
+    """Communication direction represented by a boundary."""
 
     SYMMETRIC = auto()
     SEND_ONLY = auto()
@@ -145,11 +145,15 @@ class SimpleBoundary(Boundary):
 
 @dataclasses.dataclass
 class NestedBoundary(Boundary):
-    """An explicit horizontal window relative to the compute-domain origin.
+    """A boundary defined by an explicit horizontal data window.
 
-    Unlike SimpleBoundary, the exchanged region is fully described by
-    window_start and window_extent. Windows may reference allocated halo
-    storage, for example when describing a fine-grid receive region.
+    ``window_start`` is relative to the Quantity compute-domain origin,
+    so negative offsets may address allocated halo storage.
+    ``window_extent`` gives the size of the exchanged horizontal region.
+
+    The explicit window replaces the edge/corner geometry used by
+    SimpleBoundary. Non-horizontal dimensions span the Quantity's
+    compute domain.
     """
 
     window_start: tuple[int, int]
@@ -161,6 +165,7 @@ class NestedBoundary(Boundary):
         n_points: int,
         interior: bool,
     ) -> Any:
+        # NestedBoundary windows fully define the exchanged region.
         boundary_slice = self._slice_from_fields(
             quantity.dims,
             quantity.origin,
@@ -190,8 +195,8 @@ class NestedBoundary(Boundary):
 
         if len(i_indices) != 1 or len(j_indices) != 1:
             raise ValueError(
-                "NestedBoundary requires exactly one i-like and one j-like "
-                f"horizontal dimension, got dims={dims}"
+                "NestedBoundary requires exactly one I dimension and one J dimension, "
+                f"got dims={dims}"
             )
 
         return i_indices[0], j_indices[0]
@@ -214,9 +219,7 @@ class NestedBoundary(Boundary):
 
         if i_start < 0 or j_start < 0 or i_stop > shape[i_dim] or j_stop > shape[j_dim]:
             raise ValueError(
-                "NestedBoundary window lies outside allocated data: "
-                f"dims={dims}, start={self.window_start}, "
-                f"extent={self.window_extent}, origin={origin}, shape={shape}"
+                "NestedBoundary window lies outside the allocated Quantity."
             )
 
         result[i_dim] = slice(i_start, i_stop)
