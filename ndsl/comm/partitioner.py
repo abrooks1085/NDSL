@@ -723,12 +723,22 @@ class NestedPartitioner(TilePartitioner):
     The mapping describes the nested region's placement within its parent grid.
     """
 
+    _NEIGHBOR_OFFSETS = {
+        WEST: (-1, 0),
+        EAST: (1, 0),
+        SOUTH: (0, -1),
+        NORTH: (0, 1),
+        SOUTHWEST: (-1, -1),
+        SOUTHEAST: (1, -1),
+        NORTHWEST: (-1, 1),
+        NORTHEAST: (1, 1),
+    }
+
     def __init__(
         self,
         layout: tuple[int, int],
         mapping: NestMapping,
     ) -> None:
-
         super().__init__(layout=layout)
         self.mapping = mapping
 
@@ -736,45 +746,157 @@ class NestedPartitioner(TilePartitioner):
     def fine_extent(self) -> tuple[int, int]:
         return self.mapping.fine_extent
 
-    def boundary(self, boundary_type: int, rank: int) -> bd.SimpleBoundary | None:
-        """Return an internal nested-grid boundary or None at the nest exterior."""
+    def _neighbor_rank(self, boundary_type: int, rank: int) -> int | None:
+        """Return the neighboring nested rank, or None at the nest exterior."""
         j, i = self.subtile_index(rank)
         ny, nx = self.layout
 
-        offsets = {
-            WEST: (-1, 0),
-            EAST: (1, 0),
-            SOUTH: (0, -1),
-            NORTH: (0, 1),
-            SOUTHWEST: (-1, -1),
-            SOUTHEAST: (1, -1),
-            NORTHWEST: (-1, 1),
-            NORTHEAST: (1, 1),
-        }
-        di, dj = offsets[boundary_type]
-
+        di, dj = self._NEIGHBOR_OFFSETS[boundary_type]
         neighbor_i = i + di
         neighbor_j = j + dj
 
         if neighbor_i < 0 or neighbor_i >= nx or neighbor_j < 0 or neighbor_j >= ny:
             return None
 
+        return neighbor_j * nx + neighbor_i
+
+    def boundary(self, boundary_type: int, rank: int) -> bd.SimpleBoundary | None:
+        """Return an internal nested-grid boundary or None at the nest exterior."""
+        return copy.copy(self._cached_boundary(boundary_type, rank))
+
+    @functools.lru_cache(maxsize=DEFAULT_CACHE_SIZE)
+    def _cached_boundary(
+        self,
+        boundary_type: int,
+        rank: int,
+    ) -> bd.SimpleBoundary | None:
+        """Build and cache a nested-grid boundary."""
+        neighbor_rank = self._neighbor_rank(boundary_type, rank)
+
+        if neighbor_rank is None:
+            return None
+
         return bd.SimpleBoundary(
             boundary_type=boundary_type,
             from_rank=rank,
-            to_rank=neighbor_j * nx + neighbor_i,
+            to_rank=neighbor_rank,
             n_clockwise_rotations=0,
         )
 
     def is_external_boundary(self, boundary_type: int, rank: int) -> bool:
-        return self.boundary(boundary_type, rank) is None
+        """Return whether a boundary lies on the exterior of the nested region."""
+        return self._cached_boundary(boundary_type, rank) is None
 
     def external_boundary_types(self, rank: int) -> tuple[int, ...]:
+        """Return all exterior boundary types for a nested rank."""
         return tuple(
             boundary_type
             for boundary_type in constants.BOUNDARY_TYPES
             if self.is_external_boundary(boundary_type, rank)
         )
+
+    def _boundary_target_slices(
+        self,
+        boundary_type: int,
+        nested_i_slice: slice,
+        nested_j_slice: slice,
+        i_dim: str,
+        j_dim: str,
+        coarse_n_points: int,
+    ) -> tuple[slice, slice]:
+        """Return the nest-local coarse-grid region required for a boundary."""
+        nested_i_start = nested_i_slice.start
+        nested_i_stop = nested_i_slice.stop
+        nested_j_start = nested_j_slice.start
+        nested_j_stop = nested_j_slice.stop
+
+        if boundary_type in (WEST, SOUTHWEST, NORTHWEST):
+            target_i_start = nested_i_start - coarse_n_points
+            target_i_stop = nested_i_start
+
+            if i_dim == constants.I_INTERFACE_DIM:
+                target_i_stop += 1
+
+        elif boundary_type in (EAST, SOUTHEAST, NORTHEAST):
+            target_i_start = nested_i_stop
+            target_i_stop = nested_i_stop + coarse_n_points
+
+            if i_dim == constants.I_INTERFACE_DIM:
+                target_i_start -= 1
+
+        else:
+            target_i_start = nested_i_start
+            target_i_stop = nested_i_stop
+
+        if boundary_type in (SOUTH, SOUTHWEST, SOUTHEAST):
+            target_j_start = nested_j_start - coarse_n_points
+            target_j_stop = nested_j_start
+
+            if j_dim == constants.J_INTERFACE_DIM:
+                target_j_stop += 1
+
+        elif boundary_type in (NORTH, NORTHWEST, NORTHEAST):
+            target_j_start = nested_j_stop
+            target_j_stop = nested_j_stop + coarse_n_points
+
+            if j_dim == constants.J_INTERFACE_DIM:
+                target_j_start -= 1
+
+        else:
+            target_j_start = nested_j_start
+            target_j_stop = nested_j_stop
+
+        return (
+            slice(target_i_start, target_i_stop),
+            slice(target_j_start, target_j_stop),
+        )
+
+    def _parent_tile_context(
+        self,
+        parent_partitioner: Partitioner,
+    ) -> tuple[TilePartitioner, int]:
+        """Return the parent tile partitioner and its root communicator rank."""
+        if isinstance(parent_partitioner, CubedSpherePartitioner):
+            return (
+                parent_partitioner.tile,
+                parent_partitioner.tile_root_rank(self.mapping.parent_rank),
+            )
+
+        if isinstance(parent_partitioner, TilePartitioner):
+            return parent_partitioner, 0
+
+        raise TypeError(
+            "parent_partitioner must be a CubedSpherePartitioner or TilePartitioner"
+        )
+
+    @staticmethod
+    def _make_parent_to_nested_boundary_pair(
+        parent_world_rank: int,
+        nested_world_rank: int,
+        parent_start: tuple[int, int],
+        nested_start: tuple[int, int],
+        extent: tuple[int, int],
+    ) -> tuple[bd.NestedBoundary, bd.NestedBoundary]:
+        """Construct matching parent-send and nested-receive boundaries."""
+        parent_boundary = bd.NestedBoundary(
+            from_rank=parent_world_rank,
+            to_rank=nested_world_rank,
+            n_clockwise_rotations=0,
+            window_start=parent_start,
+            window_extent=extent,
+            comm_type=bd.CommType.SEND_ONLY,
+        )
+
+        nested_boundary = bd.NestedBoundary(
+            from_rank=nested_world_rank,
+            to_rank=parent_world_rank,
+            n_clockwise_rotations=0,
+            window_start=nested_start,
+            window_extent=extent,
+            comm_type=bd.CommType.RECV_ONLY,
+        )
+
+        return parent_boundary, nested_boundary
 
     def parent_to_nested_boundaries(
         self,
@@ -794,6 +916,44 @@ class NestedPartitioner(TilePartitioner):
         ...,
     ]:
         """Build parent-to-nested boundaries for a coarse transport quantity."""
+        boundaries = self._cached_parent_to_nested_boundaries(
+            parent_partitioner=parent_partitioner,
+            parent_tile_extent=parent_tile_extent,
+            nested_global_extent=nested_global_extent,
+            dims=dims,
+            boundary_type=boundary_type,
+            nested_rank=nested_rank,
+            nested_world_rank=nested_world_rank,
+            coarse_n_points=coarse_n_points,
+        )
+
+        return tuple(
+            (
+                copy.copy(parent_boundary),
+                copy.copy(nested_boundary),
+            )
+            for parent_boundary, nested_boundary in boundaries
+        )
+
+    @functools.lru_cache(maxsize=DEFAULT_CACHE_SIZE)
+    def _cached_parent_to_nested_boundaries(
+        self,
+        parent_partitioner: Partitioner,
+        parent_tile_extent: tuple[int, ...],
+        nested_global_extent: tuple[int, ...],
+        dims: tuple[str, ...],
+        boundary_type: int,
+        nested_rank: int,
+        nested_world_rank: int,
+        coarse_n_points: int,
+    ) -> tuple[
+        tuple[
+            bd.NestedBoundary,
+            bd.NestedBoundary,
+        ],
+        ...,
+    ]:
+        """Build and cache parent-to-nested boundary geometry."""
 
         if not self.is_external_boundary(boundary_type, nested_rank):
             return ()
@@ -813,72 +973,45 @@ class NestedPartitioner(TilePartitioner):
         i_axis = i_axes[0]
         j_axis = j_axes[0]
 
+        # Determine this nested rank's compute region in nest-global coordinates.
         nested_slice = self.subtile_slice(
             rank=nested_rank,
             global_dims=dims,
             global_extent=nested_global_extent,
             overlap=True,
         )
-
         nested_i_slice = nested_slice[i_axis]
         nested_j_slice = nested_slice[j_axis]
 
-        nested_i_start = nested_i_slice.start
-        nested_i_stop = nested_i_slice.stop
-        nested_j_start = nested_j_slice.start
-        nested_j_stop = nested_j_slice.stop
+        # Determine the nest-local coarse-grid region supplied by the parent.
+        target_i_slice, target_j_slice = self._boundary_target_slices(
+            boundary_type=boundary_type,
+            nested_i_slice=nested_i_slice,
+            nested_j_slice=nested_j_slice,
+            i_dim=dims[i_axis],
+            j_dim=dims[j_axis],
+            coarse_n_points=coarse_n_points,
+        )
 
-        if boundary_type in (WEST, SOUTHWEST, NORTHWEST):
-            target_i_start = nested_i_start - coarse_n_points
-            target_i_stop = nested_i_start
-            if dims[i_axis] == constants.I_INTERFACE_DIM:
-                target_i_stop += 1
-        elif boundary_type in (EAST, SOUTHEAST, NORTHEAST):
-            target_i_start = nested_i_stop
-            target_i_stop = nested_i_stop + coarse_n_points
-            if dims[i_axis] == constants.I_INTERFACE_DIM:
-                target_i_start -= 1
-        else:
-            target_i_start = nested_i_start
-            target_i_stop = nested_i_stop
-
-        if boundary_type in (SOUTH, SOUTHWEST, SOUTHEAST):
-            target_j_start = nested_j_start - coarse_n_points
-            target_j_stop = nested_j_start
-            if dims[j_axis] == constants.J_INTERFACE_DIM:
-                target_j_stop += 1
-        elif boundary_type in (NORTH, NORTHWEST, NORTHEAST):
-            target_j_start = nested_j_stop
-            target_j_stop = nested_j_stop + coarse_n_points
-            if dims[j_axis] == constants.J_INTERFACE_DIM:
-                target_j_start -= 1
-        else:
-            target_j_start = nested_j_start
-            target_j_stop = nested_j_stop
-
+        # Translate the requested region into parent-tile coordinates.
         parent_i0, parent_j0 = self.mapping.parent_start
 
-        parent_target_i_start = parent_i0 + target_i_start
-        parent_target_i_stop = parent_i0 + target_i_stop
-        parent_target_j_start = parent_j0 + target_j_start
-        parent_target_j_stop = parent_j0 + target_j_stop
+        parent_target_i_slice = slice(
+            parent_i0 + target_i_slice.start,
+            parent_i0 + target_i_slice.stop,
+        )
+        parent_target_j_slice = slice(
+            parent_j0 + target_j_slice.start,
+            parent_j0 + target_j_slice.stop,
+        )
 
-        if isinstance(parent_partitioner, CubedSpherePartitioner):
-            parent_tile = parent_partitioner.tile
-            tile_root_rank = parent_partitioner.tile_root_rank(self.mapping.parent_rank)
-        elif isinstance(parent_partitioner, TilePartitioner):
-            parent_tile = parent_partitioner
-            tile_root_rank = 0
-        else:
-            raise TypeError(
-                "parent_partitioner must be a CubedSpherePartitioner "
-                "or TilePartitioner"
-            )
+        parent_tile, tile_root_rank = self._parent_tile_context(parent_partitioner)
 
         result: list[tuple[bd.NestedBoundary, bd.NestedBoundary]] = []
-
         covered_points = 0
 
+        # A nested boundary may span multiple parent ranks. Build one exchange
+        # pair for each parent rank whose compute domain intersects the target.
         for parent_tile_rank in range(parent_tile.total_ranks):
             parent_slice = parent_tile.subtile_slice(
                 rank=parent_tile_rank,
@@ -890,10 +1023,22 @@ class NestedPartitioner(TilePartitioner):
             parent_i_slice = parent_slice[i_axis]
             parent_j_slice = parent_slice[j_axis]
 
-            overlap_i_start = max(parent_target_i_start, parent_i_slice.start)
-            overlap_j_start = max(parent_target_j_start, parent_j_slice.start)
-            overlap_i_stop = min(parent_target_i_stop, parent_i_slice.stop)
-            overlap_j_stop = min(parent_target_j_stop, parent_j_slice.stop)
+            overlap_i_start = max(
+                parent_target_i_slice.start,
+                parent_i_slice.start,
+            )
+            overlap_i_stop = min(
+                parent_target_i_slice.stop,
+                parent_i_slice.stop,
+            )
+            overlap_j_start = max(
+                parent_target_j_slice.start,
+                parent_j_slice.start,
+            )
+            overlap_j_stop = min(
+                parent_target_j_slice.stop,
+                parent_j_slice.stop,
+            )
 
             if overlap_i_start >= overlap_i_stop or overlap_j_start >= overlap_j_stop:
                 continue
@@ -902,6 +1047,7 @@ class NestedPartitioner(TilePartitioner):
                 overlap_i_stop - overlap_i_start,
                 overlap_j_stop - overlap_j_start,
             )
+
             parent_world_rank = tile_root_rank + parent_tile_rank
 
             parent_start = (
@@ -909,33 +1055,24 @@ class NestedPartitioner(TilePartitioner):
                 overlap_j_start - parent_j_slice.start,
             )
             nested_start = (
-                overlap_i_start - parent_i0 - nested_i_start,
-                overlap_j_start - parent_j0 - nested_j_start,
+                overlap_i_start - parent_i0 - nested_i_slice.start,
+                overlap_j_start - parent_j0 - nested_j_slice.start,
             )
 
-            parent_boundary = bd.NestedBoundary(
-                from_rank=parent_world_rank,
-                to_rank=nested_world_rank,
-                n_clockwise_rotations=0,
-                window_start=parent_start,
-                window_extent=extent,
-                comm_type=bd.CommType.SEND_ONLY,
+            result.append(
+                self._make_parent_to_nested_boundary_pair(
+                    parent_world_rank=parent_world_rank,
+                    nested_world_rank=nested_world_rank,
+                    parent_start=parent_start,
+                    nested_start=nested_start,
+                    extent=extent,
+                )
             )
 
-            nested_boundary = bd.NestedBoundary(
-                from_rank=nested_world_rank,
-                to_rank=parent_world_rank,
-                n_clockwise_rotations=0,
-                window_start=nested_start,
-                window_extent=extent,
-                comm_type=bd.CommType.RECV_ONLY,
-            )
-
-            result.append((parent_boundary, nested_boundary))
             covered_points += extent[0] * extent[1]
 
-        expected_points = (target_i_stop - target_i_start) * (
-            target_j_stop - target_j_start
+        expected_points = (target_i_slice.stop - target_i_slice.start) * (
+            target_j_slice.stop - target_j_slice.start
         )
 
         if covered_points != expected_points:

@@ -147,9 +147,9 @@ class SimpleBoundary(Boundary):
 class NestedBoundary(Boundary):
     """A boundary defined by an explicit horizontal data window.
 
-    ``window_start`` is relative to the Quantity compute-domain origin,
+    window_start is relative to the Quantity compute-domain origin,
     so negative offsets may address allocated halo storage.
-    ``window_extent`` gives the size of the exchanged horizontal region.
+    window_extent gives the size of the exchanged horizontal region.
 
     The explicit window replaces the edge/corner geometry used by
     SimpleBoundary. Non-horizontal dimensions span the Quantity's
